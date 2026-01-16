@@ -21,24 +21,30 @@
 // CORE TIME FUNCTIONS (New Clean API)
 // ============================================================================
 /**
- * Set absolute time from ANY source (RTC, NTP, Server, Manual)
- * This is your SINGLE point of time synchronization
+ * sync LocalTime ANY source (RTC, NTP, Server, Manual)
+ * set sync point to calculate relative_ms
  *
  * Example usage:
  *   syncTime(rtc.now().unixtime() * 1000ULL);  // From RTC
  *   syncTime(ntpTime);                          // From NTP
  *   syncTime(serverTime);                       // From WebSocket
  */
-void syncTime(uint64_t &localTime , uint64_t Timesource_ms);
+void syncTime_setSyncPoint(uint64_t &localTime , uint64_t Timesource_s);
 
 /**
- * Get current device time (auto-calculates from sync point)
+ * Calculate relative Time in ms scale , 
+ * et current device time (auto-calculates from sync point)
  * Returns: Unix timestamp in milliseconds
  *
  * - If synced: localTime_ms + elapsed millis()
  * - If not synced: millis()
  */
-uint64_t syncTime_getElapse(uint64_t localTime);
+uint64_t syncTime_calcRelative_ms(uint64_t localTime_s);
+
+uint32_t syncTime_getElapse_ms();
+
+
+uint64_t syncTime_calcRelative_ms(uint64_t localTime_s);
 
 /**
  * Check if device time has been synchronized with external source
@@ -46,9 +52,30 @@ uint64_t syncTime_getElapse(uint64_t localTime);
  */
 bool syncTime_isSynced();
 
-// ============================================================================
-// FORMATTING FUNCTIONS (Timezone-Aware)
-// ============================================================================
+
+/**
+ * Sync from external source (Server/NTP) with optional RTC write-back
+ * Only syncs if drift exceeds threshold
+ *
+ * Parameters:
+ *   - localTime: Reference to device time variable
+ *   - TimeSource_ms: External timestamp in milliseconds
+ *   - driftThreshold_ms: Minimum drift to trigger sync (default: 1000ms)
+ *
+ * Returns: true if synced, false if skipped (drift < threshold)
+ */
+bool syncTime_ifDrifted(uint64_t &localTime, uint64_t TimeSource_ms,
+                           uint64_t driftThreshold_ms = 1000ULL);
+
+/**
+ * Get current drift between device time and external source
+ * Useful for diagnostics without triggering sync
+ *
+ * Returns: drift in ms (positive = device ahead, negative = device behind)
+ */
+int64_t syncTime_getDrift(uint64_t localTime, uint64_t TimeSource_ms);
+
+
 
 /**
  * Format Unix timestamp to human-readable string with timezone support
@@ -67,32 +94,5 @@ void syncTime_formatUnix(char* outBuf, uint64_t unixMs, int timezoneOffsetHours)
  * Convenience wrappers for common timezones
  */
 void syncTime_formatUnix_UTC(char* outBuf, uint64_t unixMs);     // UTC (GMT+0)
-
-// ============================================================================
-// EXTERNAL TIME SYNC (Server/NTP with optional RTC write-back)
-// ============================================================================
-
-/**
- * Sync from external source (Server/NTP) with optional RTC write-back
- * Only syncs if drift exceeds threshold
- *
- * Parameters:
- *   - localTime: Reference to device time variable
- *   - TimeSource_ms: External timestamp in milliseconds
- *   - rtcPtr: Pointer to RTC_DS3231 object (nullptr = don't update RTC)
- *   - driftThreshold_ms: Minimum drift to trigger sync (default: 1000ms)
- *
- * Returns: true if synced, false if skipped (drift < threshold)
- */
-bool syncTime_fromExternal(uint64_t &localTime, uint64_t TimeSource_ms,
-                           void* rtcPtr = nullptr, uint64_t driftThreshold_ms = 1000ULL);
-
-/**
- * Get current drift between device time and external source
- * Useful for diagnostics without triggering sync
- *
- * Returns: drift in ms (positive = device ahead, negative = device behind)
- */
-int64_t syncTime_getDrift(uint64_t localTime, uint64_t TimeSource_ms);
 
 #endif // SYNCTIME_UTIL_V2_H

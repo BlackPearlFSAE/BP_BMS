@@ -18,7 +18,7 @@ bool RTCinit(RTC_DS3231 &rtc,TwoWire* WireRTC);
  * Parameters:
  *   - unix_time: Unix timestamp in seconds
  */
-void RTCcalibrate(RTC_DS3231 &rtc,uint64_t unix_time, bool &flag);
+void RTCcalibrate(RTC_DS3231 &rtc,uint32_t unix_time, bool &flag);
 /**
  * Set RTC time from compile-time date/time
  * (Use only for development/testing)

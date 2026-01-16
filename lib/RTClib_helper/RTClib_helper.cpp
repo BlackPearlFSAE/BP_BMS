@@ -12,7 +12,7 @@ bool RTCinit(RTC_DS3231 &rtc,TwoWire* WireRTC) {
   return true;
 }
 
-void RTCcalibrate(RTC_DS3231 &rtc,uint64_t unix_time, bool &flag) {
+void RTCcalibrate(RTC_DS3231 &rtc,uint32_t unix_time, bool &flag) {
   if (!flag) return;
   rtc.adjust(DateTime(unix_time));
 }

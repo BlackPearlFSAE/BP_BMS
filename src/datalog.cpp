@@ -61,8 +61,9 @@ bool I2C1_connect = false;
 // ---- Timing configs
 RTC_DS3231 rtc;
 bool RTCavailable = false;
+unsigned long lastTimeSourceSync = 0;
 unsigned long lastExternalSync = 0;
-uint64_t DEVICE_UNIX_TIME = 0;
+uint64_t RTC_UNIX_TIME = 0;
 const unsigned long LOCAL_SYNC_INTERVAL = 1000;
 const unsigned long REMOTE_SYNC_INTERVAL = 60000;
 
@@ -76,7 +77,6 @@ const unsigned long SD_APPEND_INTERVAL = 200;
 const unsigned long AMS_LOG_INTERVAL = 1000;    // AMS summary every 1 second
 const unsigned long SD_FLUSH_INTERVAL = 1000;
 const unsigned long SD_CLOSE_INTERVAL = 10000;
-
 
 // Session directory and file paths
 char sessionDirPath[32] = {0};
@@ -310,8 +310,8 @@ void setup() {
     openAllFiles();
   }
 
-  syncTime(DEVICE_UNIX_TIME, WiFi32_isNTPSynced() ? WiFi32_getNTPTime() : 1000000000000ULL);
-  syncTime(DEVICE_UNIX_TIME, RTCavailable ? RTC_getUnix(rtc,RTCavailable) : 1000000000000ULL);
+  // RTCcalibrate(rtc, WiFi32_getNTPTime()/1000ULL,RTCavailable); 
+  syncTime_setSyncPoint(RTC_UNIX_TIME, RTCavailable ? RTC_getUnix(rtc,RTCavailable) : 1000000000000ULL);
 
   Serial.print("Time synced: ");
   Serial.println(RTC_getISO(rtc,RTCavailable));
@@ -368,41 +368,37 @@ void setup() {
 // MAIN LOOP
 // ============================================================================
 void loop() {
-  DEVICE_UNIX_TIME = (uint64_t)time(NULL) * 1000ULL;
-  uint64_t SESSION_TIME = millis();
-  uint64_t CURRENT_UNIX_TIME = syncTime_getElapse(DEVICE_UNIX_TIME);
 
-  // Time Sync: Local source -> ESP32 RTC (1s)
-  static unsigned long lastTimeSourceSync = 0;
-  if (SESSION_TIME - lastTimeSourceSync >= LOCAL_SYNC_INTERVAL) {
-    uint64_t sourceTimeMs = (uint64_t)RTC_getUnix(rtc,RTCavailable);
-    // uint64_t sourceTimeMs = WiFi32_getNTPTime();              // NTP
-    // uint64_t sourceTimeMs = BPMobile_getLastServerTime();     // Server
-    if (sourceTimeMs > 0) {
-      syncTime(DEVICE_UNIX_TIME, sourceTimeMs);
-    }
-    lastTimeSourceSync = SESSION_TIME;
+  uint64_t SESSION_TIME_MS = millis();
+  // Time Sync: fetch RTC DS3231 every 1s 
+  uint64_t Time_placeholder = 0;
+  if (SESSION_TIME_MS - lastTimeSourceSync >= LOCAL_SYNC_INTERVAL) {
+    Time_placeholder = (uint64_t)RTC_getUnix(rtc,RTCavailable)*1000ULL;
+    lastTimeSourceSync = SESSION_TIME_MS;
   }
+  // Set syncpoint , and calculate UnixTime_ms + ElapseTime_ms 
+  if (Time_placeholder > 0) (RTC_UNIX_TIME, Time_placeholder);
+  uint64_t CURRENT_UNIX_TIME_MS = syncTime_calcRelative_ms(RTC_UNIX_TIME);
+  /* DEBUG TIME */
+  // char timeBuf[32];
+  // syncTime_formatUnix(timeBuf, CURRENT_UNIX_TIME_MS, 7);  // UTC+7
+  // Serial.println(timeBuf);
+  // // Serial.println(CURRENT_UNIX_TIME_MS);
+  // return;
 
-  // Time Sync: Remote source -> DS3231 (60s)
-  if (SESSION_TIME - lastExternalSync >= REMOTE_SYNC_INTERVAL) {
+
+  // Time Sync: Remote source -> DS3231 (60s period)
+  if (SESSION_TIME_MS - lastExternalSync >= REMOTE_SYNC_INTERVAL) {
     uint64_t externalTime = WiFi32_getNTPTime();              // NTP
     // uint64_t externalTime = BPMobile_getLastServerTime();  // Server
 
     if (externalTime > 0 && RTCavailable) {
-      int64_t drift = syncTime_getDrift(DEVICE_UNIX_TIME, externalTime);
-      if (llabs(drift) >= 1000) {
-        RTCcalibrate(rtc,externalTime,RTCavailable);
-        Serial.printf("[TimeSync] DS3231 updated, drift: %lld ms\n", drift);
-      }
+      if(syncTime_ifDrifted(RTC_UNIX_TIME, externalTime,1000))
+        RTCcalibrate(rtc,RTC_UNIX_TIME/1000ULL,RTCavailable);
     }
-    lastExternalSync = SESSION_TIME;
+    lastExternalSync = SESSION_TIME_MS;
   }
 
-  // ============================================================================
-  // TODO: Add your BMU data acquisition here
-  // Example: Read from CAN bus, update BMU_Package[0..7] and AMS_Package
-  // ============================================================================
 
   // Mock data for testing (remove in production)
   #ifdef MOCK_DATA
@@ -428,11 +424,11 @@ void loop() {
   }
 
   // Queue SD log entry
-  if (sdCardReady && sdQueue != NULL && (SESSION_TIME - lastSDLog >= SD_APPEND_INTERVAL)) {
+  if (sdCardReady && sdQueue != NULL && (SESSION_TIME_MS - lastSDLog >= SD_APPEND_INTERVAL)) {
     SDLogEntry entry;
     entry.dataPoint = dataPoint;
-    entry.unixTime = CURRENT_UNIX_TIME;
-    entry.sessionTime = SESSION_TIME;
+    entry.unixTime = CURRENT_UNIX_TIME_MS;
+    entry.sessionTime = SESSION_TIME_MS;
 
     // Copy sensor data with mutex
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -448,7 +444,7 @@ void loop() {
       Serial.println("[Loop] SD queue full - data dropped");
     }
 
-    lastSDLog = SESSION_TIME;
+    lastSDLog = SESSION_TIME_MS;
   }
 
   // Small delay to prevent watchdog issues

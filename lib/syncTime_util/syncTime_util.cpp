@@ -2,11 +2,6 @@
 #include <syncTime_util.h>
 // #include <RTClib.h>  // For RTC_DS3231
 
-// ============================================================================
-// CLEAN TIME SYSTEM - Source-Agnostic Unix Timestamp Management
-// ============================================================================
-// for using with any data time object or data
-
 unsigned long sync_point = 0;  // millis() when last synced
 // Sync status flag
 bool localTimeIsSynced = false;
@@ -20,17 +15,16 @@ bool localTimeIsSynced = false;
  * Accepts: Unix timestamp in milliseconds
  * Also sets ESP32 internal RTC via settimeofday()
 **/
-void syncTime(uint64_t &localTime , uint64_t Timesource_ms) {
+void syncTime_setSyncPoint(uint64_t &localTime , uint64_t Timesource_s) {
   // Set ESP32 internal RTC via settimeofday
-  struct timeval tv = {
-    .tv_sec = (time_t)(Timesource_ms / 1000ULL),
-    .tv_usec = (suseconds_t)((Timesource_ms % 1000ULL) * 1000)
-  };
-  settimeofday(&tv, nullptr);
 
-  localTime = Timesource_ms;
+  localTime = Timesource_s;
   sync_point = millis();  // Mark sync point
   localTimeIsSynced = true;
+}
+
+uint32_t syncTime_getElapse_ms(){
+  return millis()- sync_point;
 }
 
 /**
@@ -38,15 +32,13 @@ void syncTime(uint64_t &localTime , uint64_t Timesource_ms) {
  * Returns: Unix timestamp in milliseconds
  * This auto-calculates elapsed time since last sync
  */
-uint64_t syncTime_getElapse(uint64_t localTime) {
+uint64_t syncTime_calcRelative_ms(uint64_t localTime_s) {
   if (!localTimeIsSynced) {
     // Not synced - return device uptime
     return (uint64_t)millis();
   }
-
-  // Calculate elapsed time since sync
-  unsigned long elapsed = millis() - sync_point;
-  return localTime + (uint64_t)elapsed;
+  uint32_t elapse_ms = syncTime_getElapse_ms();
+  return localTime_s + (uint64_t)elapse_ms;
 }
 
 /**
@@ -61,8 +53,8 @@ bool syncTime_isSynced() {
  * Get current drift between device time and external source
  * Returns: drift in ms (positive = device ahead, negative = device behind)
  */
-int64_t syncTime_getDrift(uint64_t localTime, uint64_t TimeSource_ms) {
-  uint64_t currentTime = syncTime_getElapse(localTime);
+int64_t syncTime_getDrift(uint64_t localTime_s, uint64_t TimeSource_ms) {
+  uint64_t currentTime = syncTime_calcRelative_ms(localTime_s);
   return (int64_t)currentTime - (int64_t)TimeSource_ms;
 }
 
@@ -70,7 +62,7 @@ int64_t syncTime_getDrift(uint64_t localTime, uint64_t TimeSource_ms) {
  * Sync from external source (Server/NTP) with optional RTC write-back
  * Only syncs if drift exceeds threshold
  */
-bool syncTime_fromExternal(uint64_t &localTime, uint64_t TimeSource_ms,
+bool syncTime_ifDrifted(uint64_t &localTime, uint64_t TimeSource_ms,
                            uint64_t driftThreshold_ms) {
   // Check drift first
   int64_t drift = syncTime_getDrift(localTime, TimeSource_ms);
@@ -80,11 +72,10 @@ bool syncTime_fromExternal(uint64_t &localTime, uint64_t TimeSource_ms,
   }
 
   // Update device time
-  syncTime(localTime, TimeSource_ms);
+  syncTime_setSyncPoint(localTime, TimeSource_ms);
 
   return true;
 }
-
 
 // ============================================================================
 // FORMATTING FUNCTIONS - Timezone Support

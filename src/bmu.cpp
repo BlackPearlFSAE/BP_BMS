@@ -20,6 +20,12 @@ float cellvoltages[NUM_CELLS];
 #define CAN_TX_PIN 20
 #define CAN_RX_PIN 21
 
+// Pack BMU cell voltages into CAN message
+void packBMUCells(twai_message_t* msg, uint32_t id, float* voltages,
+                        uint8_t startCell, uint8_t numCells, float resolution);
+
+// Example to write for filter -> Make it an output of twai_filter_config_t type , to get the data strcuture need
+
 // =========================================================================
 // HARDWARE GLUE CODE (SPI IMPLEMENTATIONS)
 // =========================================================================
@@ -38,9 +44,7 @@ float cellvoltages[NUM_CELLS];
 bool canInitialized = false;
 
 /**************** Local Function Declaration *******************/
-void packCANData(uint8_t* data, float* voltages, uint8_t startCell, uint8_t numCells);
 void readAllCells();
-void sendCANFrame(uint32_t id, uint8_t* data, uint8_t len);
 
 /**************** Timing Variables *******************/
 unsigned long prevMillis = 0;
@@ -76,19 +80,20 @@ void setup() {
   =======================Mainloop===========================
 ********************************************************************/
 void loop() {
+  
   // Periodic CAN health check using CAN32_util debug
-  if (millis() - lastCANHealthCheck >= canHealthCheckInterval) {
-    lastCANHealthCheck = millis();
-    uint32_t alerts = TWAI_ALERT_ALL;
-    CAN32_twai_debug(alerts);
-  }
-
-  // Read incoming CAN messages continuously using CAN32_util
-  if (canInitialized) {
-    while (CAN32_receiveCAN(&rx_message) == ESP_OK) {
-      CAN32_debugFrame(&rx_message);
-    }
-  }
+  // if (millis() - lastCANHealthCheck >= canHealthCheckInterval) {
+  //   lastCANHealthCheck = millis();
+  //   uint32_t alerts = TWAI_ALERT_ALL;
+  //   CAN32_twai_debug(alerts);
+  // }
+  
+  // // Read incoming CAN messages continuously using CAN32_util
+  // if (canInitialized) {
+  //   while (CAN32_receiveCAN(&rx_message) == ESP_OK) {
+  //     CAN32_debugFrame(&rx_message);
+  //   }
+  // }
 
   readAllCells();
 
@@ -96,63 +101,22 @@ void loop() {
     prevMillis = millis();
 
     // Pack and send cells 0-7 (8 bytes @ 0.02V resolution)
-    uint8_t cellData1[8];
-    packCANData(cellData1, cellvoltages, 0, 8);
-    sendCANFrame(0x03, cellData1, 8);
+    packBMUCells(&tx_message, 0x06, cellvoltages, 0, 8, 0.02);
+    if (CAN32_sendCAN(&tx_message) != ESP_OK) {
+      Serial.println("CAN TX failed for cells 0-7");
+    }
 
     // Pack and send cells 8-9 (2 bytes @ 0.02V resolution)
-    uint8_t cellData2[2];
-    packCANData(cellData2, cellvoltages, 8, 2);
-    sendCANFrame(0x04, cellData2, 2);
+    packBMUCells(&tx_message, 0x07, cellvoltages, 8, 2, 0.02);
+    if (CAN32_sendCAN(&tx_message) != ESP_OK  ) {
+      Serial.println("CAN TX failed for cells 8-9");
+    }
   }
 }
 
 /*******************************************************************
   =======================Local Functions===========================
 ********************************************************************/
-
-void packCANData(uint8_t* data, float* voltages, uint8_t startCell, uint8_t numCells) {
-  for (int i = 0; i < numCells && i < 8; i++) {
-    data[i] = (uint8_t)(voltages[startCell + i]/0.02);
-  }
-}
-
-void sendCANFrame(uint32_t id, uint8_t* data, uint8_t len) {
-  if (!canInitialized) {
-    Serial.println("CAN not initialized, skipping transmission");
-    return;
-  }
-
-  if (len > 8) len = 8;
-
-  tx_message.identifier = id;
-  tx_message.extd = 0;
-  tx_message.rtr = 0;
-  tx_message.data_length_code = len;
-
-  for (int i = 0; i < len; i++) {
-    tx_message.data[i] = data[i];
-  }
-
-  int result = CAN32_sendCAN(&tx_message);
-
-  if (result == ESP_OK) {
-    Serial.print("CAN TX: 0x");
-    Serial.print(id, HEX);
-    Serial.print(" [");
-    for (int i = 0; i < len; i++) {
-      if (data[i] < 0x10) Serial.print("0");
-      Serial.print(data[i], HEX);
-      if (i < len - 1) Serial.print(" ");
-    }
-    Serial.println("]");
-  } else if (result == ESP_ERR_TIMEOUT) {
-    Serial.println("CAN TX TIMEOUT - bus busy");
-  } else {
-    Serial.print("CAN TX FAILED with error: ");
-    Serial.println(result);
-  }
-}
 
 void readAllCells(){
   wakeup_sleep(TOTAL_IC);
@@ -161,10 +125,27 @@ void readAllCells(){
   int8_t error = LTC6811_rdcv(CELL_CH_ALL, TOTAL_IC, bms_ic);
   for (int i = 0; i < NUM_CELLS; i++) {
     cellvoltages[i] = bms_ic[0].cells.c_codes[i] * 0.0001;
-    Serial.print("Cell ");
-    Serial.print(i + 1);
-    Serial.print(": ");
-    Serial.print(cellvoltages[i], 4);
-    Serial.println(" V");
+    // Serial.print("Cell ");
+    // Serial.print(i + 1);
+    // Serial.print(": ");
+    // Serial.print(cellvoltages[i], 4);
+    // Serial.println(" V");
   }
 }
+
+// Pack BMU cell voltages into CAN message
+void packBMUCells(twai_message_t* msg, uint32_t id, float* voltages,
+                        uint8_t startCell, uint8_t numCells, float resolution) {
+  msg->identifier = id;
+  msg->extd = 0;
+  msg->rtr = 0;
+  msg->data_length_code = (numCells > 8) ? 8 : numCells;
+
+  for (int i = 0; i < msg->data_length_code; i++) {
+    msg->data[i] = (uint8_t)(voltages[startCell + i] / resolution);
+  }
+}// Pack BMU cell voltages into CAN message
+
+
+
+// Example to write for filter -> Make it an output of twai_filter_config_t type , to get the data strcuture need
