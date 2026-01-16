@@ -1,0 +1,17 @@
+{
+  "name": "CAN32_util",
+  "version": "1.0.0",
+  "description": "ESP32 CAN bus utility library for BMS - provides CAN communication and message handling",
+  "keywords": ["can", "canbus", "communication", "esp32", "twai"],
+  "authors": [
+    {
+      "name": "FSAE BMS Team"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"]
+}

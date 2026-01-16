@@ -1,0 +1,21 @@
+{
+  "name": "BP_mobile_util",
+  "version": "1.0.0",
+  "description": "BP Mobile server integration utility for BMS - WebSocket communication and data publishing",
+  "keywords": ["websocket", "communication", "server", "bpmobile", "data-logging"],
+  "authors": [
+    {
+      "name": "FSAE BMS Team"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"],
+  "dependencies": {
+    "ArduinoJson": "*",
+    "WebSocketsClient": "*"
+  }
+}
