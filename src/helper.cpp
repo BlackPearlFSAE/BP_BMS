@@ -85,33 +85,43 @@ uint16_t toUint16FromBitarrayLSB(const bool *bitarr) {
 }
 
 /*=============================================================== CAN bus
------( Check the spreadsheet in README.md for Communication Agreement )*/
-// 1 CE 1 0A 00
-// 0001 1100 1110 0001 0000 1010 0000 0000
+ * Extended CAN ID Protocol: 0x18 [Prio] [SRC_ADDRESS] 00 [Msg]
+ * Format: 0x18PMOOMM where P=Priority, SRC_ADDRESS = (Module ID 1-8), MM=MsgNum
+ * Example: 0x18210001 = Priority 2, SRC_ADDRESS 1, Message 1
+ */
 
+// Create 11-bit Standard CAN ID: [Prio:4][Src:4][Msg:4]
 uint16_t createCANID(uint8_t PRIORITY, uint8_t SRC_ADDRESS, uint8_t MSG_NUM) {
     uint16_t canID = 0;
-    canID |= ((PRIORITY & 0x0F) << 8);        // (PP) Priority (bits 30–31)
-    canID |= ((SRC_ADDRESS & 0x0F) << 4);      // (SS) Source address (bits 8–15)
-    canID |= (MSG_NUM & 0x0F);            // (DD) Destination address (bits 0–7)
+    canID |= ((PRIORITY & 0x0F) << 8);
+    canID |= ((SRC_ADDRESS & 0x0F) << 4);
+    canID |= (MSG_NUM & 0x0F);
     return canID;
 }
 
-// Decode extended CAN ID
-void decodeExtendedCANID(struct extCANIDDecoded *myCAN ,uint32_t canID) {
-
-    myCAN->PRIORITY = (canID >> 24) & 0xFF;        // Extract priority (bits 24-29)
-    myCAN->BASE_ID = (canID >> 20) & 0x0F;         // Extract Base ID (bits 20-23)
-    myCAN->SRC = (canID >> 12) & 0xFF;             // Extract Source Address (bits 12-19)
-    myCAN->DEST = (canID >> 4) & 0xFF;             // Extract destination address (bits 4-11)
-    myCAN->MSG_NUM = canID & 0x0F;                 // Extract Message Number (bits 0-3)
-    
+// Create 29-bit Extended CAN ID: 0x18 [Prio:4] [SRC_ADDRESS:4] 00 [Msg:4]
+uint32_t createExtendedCANID(uint8_t PRIORITY, uint8_t SRC_ADDRESS, uint8_t MSG_NUM) {
+    uint32_t canID = 0x18000000;
+    canID |= ((PRIORITY & 0x0F) << 20);
+    canID |= ((SRC_ADDRESS & 0x0F) << 16);
+    canID |= (MSG_NUM & 0x0F);
+    return canID;
 }
 
+// Decode 29-bit Extended CAN ID
+void decodeExtendedCANID(struct extCANIDDecoded *myCAN, uint32_t canID) {
+    myCAN->BASE_ID = (canID >> 24) & 0xFF;         // 0x18
+    myCAN->PRIORITY = (canID >> 20) & 0x0F;        // Priority nibble
+    myCAN->SRC = (canID >> 16) & 0x0F;             // SRC_ADDRESS number (1-8)
+    myCAN->DEST = (canID >> 8) & 0xFF;             // Reserved (0x00)
+    myCAN->MSG_NUM = canID & 0x0F;                 // Message number
+}
+
+// Decode 11-bit Standard CAN ID
 void decodeStandardCANID(struct StandardCANIDDecoded *myCAN, uint32_t canID) {
-    myCAN->PRIORITY = (canID >> 8) & 0x0F;        // Extract priority (bits 24-29)
-    myCAN->SRC = (canID >> 4) & 0x0F;             // Extract destination address (bits 4-11)
-    myCAN->MSG_NUM = canID & 0x0F;                 // Extract Message Number (bits 0-3)
+    myCAN->PRIORITY = (canID >> 8) & 0x0F;
+    myCAN->SRC = (canID >> 4) & 0x0F;
+    myCAN->MSG_NUM = canID & 0x0F;
 }
 
 #ifdef ARDUINO_ARCH_AVR

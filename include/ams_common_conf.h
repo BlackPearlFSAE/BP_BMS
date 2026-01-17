@@ -1,28 +1,37 @@
-// ============ AMS data
-// Containing Different Object representing the whole Electrical System
+// =======================================================================
+// BMS Data , Cells specs , etc.
+// =======================================================================
+#include <cstdint>
 
-// Default configuration of AMS
+// Cell Configuration 
 #define CELL_NUM 10
 #define BMU_NUM 8
 // #define BMU_NUM 2 // Test config
 // #define BMU_NUM 0 // Headless config
-/*Amita Battery*/
+
+/*LG34 Battery*/
 #define VMAX_CELL 4.2
+#define VNOM_CELL 3.7
 #define VMIN_CELL 3.2
-/*Thermistor*/
-#define TEMP_MAX_CELL 60
-#define TEMP_SENSOR_NUM 2
+#define AH_CELL 34 // Ah
 #define DVMAX 0.2
 
+/* Thermistor specs */
+#define TEMP_MAX_CELL 60 // C
+#define TEMP_SENSOR_NUM 2
+// other data here
+
 // AMS Communication
-// #define STANDARD_BIT_RATE 250E3
-#define DISCONNENCTION_TIMEOUT 650
-#define BCU_ADD 0x00
+#define STANDARD_BIT_RATE TWAI_TIMING_CONFIG_250KBITS()
+#define DISCONNENCTION_TIMEOUT 1000
+#define OBC_COMMUNICATE_TIME  500
+#define BMS_COMMUNICATE_TIME  1000
+#define BCU_ADD 0x18000000
 #define OBC_ADD 0x1806E5F4
 
 struct BMUdata {
   // Basic BMU Data
-  uint32_t bmu_id = 0x00; 
+  uint32_t BMU_ID = 0x00; 
   uint8_t V_CELL[CELL_NUM] = {0};
   uint8_t TEMP_SENSE[TEMP_SENSOR_NUM] = {0};
   uint8_t V_MODULE = 0;
