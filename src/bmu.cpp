@@ -85,6 +85,10 @@ void packBMU_MSG5_FaultCode2(twai_message_t* msg, uint32_t id);
 void processBCUConfigMsg(twai_message_t* msg);
 void debugConfig();
 
+void balanceCells();
+bool reinitCAN();
+void checkCANHealth();
+
 
 /*******************************************************************
   ==============================Setup==============================
@@ -114,18 +118,26 @@ void setup() {
   =======================Mainloop===========================
 ********************************************************************/
 void loop() {
+    // TODO: Set from EEPROM or DIP switch
   uint32_t SESSION_TIME = millis();
-  
+
+  // Periodic CAN health check and recovery
+  if (SESSION_TIME - lastCANHealthCheck >= canHealthCheckInterval) {
+    checkCANHealth();
+    lastCANHealthCheck = SESSION_TIME;
+  }
+
   // Process incoming CAN messages (BCU config updates)
   if (canbusready) {
     while (CAN32_receiveCAN(&rx_message) == ESP_OK)
-    processBCUConfigMsg(&rx_message);    
+    processBCUConfigMsg(&rx_message);
   }
   readAllCells();
   if(BMU_ReadyToCharge) balanceCells(); 
-  int ModuleNum = 3;  // TODO: Set from EEPROM or DIP switch
+  int ModuleNum = 1;
   // ======== Cell Data Transmission (1000ms interval) ========
   if(SESSION_TIME - prevMillis >= intervalMillis){
+
     // BMU MSG 1: Operation Status (Priority=2, Msg=1)
     uint32_t bmu_id_msg1 = createExtendedCANID(2, ModuleNum, 1);
     packBMU_MSG1_OperationStatus(&tx_message, bmu_id_msg1);
@@ -149,9 +161,11 @@ void loop() {
 
     prevMillis = millis();
   }
-
-  // // ======== Fault Code Transmission (1300ms interval) ========
+  
+  // TODO: Set from EEPROM or DIP switch
+  // ======== Fault Code Transmission (1300ms interval) ========
   // if(SESSION_TIME - prevFaultMillis >= faultIntervalMillis){
+
   //   // BMU MSG 4: Fault Code 1 - OV/LV (Priority=1, Msg=1)
   //   uint32_t bmu_id_fault1 = createExtendedCANID(1, ModuleNum, 1);
   //   packBMU_MSG4_FaultCode1(&tx_message, bmu_id_fault1);
@@ -189,6 +203,47 @@ void readAllCells(){
 
 void balanceCells(){
   return; // utilize basic parameter
+}
+
+// Reinitialize CAN bus after power outage or bus error
+bool reinitCAN() {
+  Serial.println("--- CAN Bus Reinitialization ---");
+
+  // Stop and uninstall existing driver
+  twai_stop();
+  twai_driver_uninstall();
+  delay(100);
+
+  // Reinitialize CAN
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();
+  canbusready = CAN32_initCANBus(CAN_TX_PIN, CAN_RX_PIN, t_config);
+
+  if (canbusready) {
+    Serial.println("CAN bus reinitialized successfully");
+  } else {
+    Serial.println("CAN bus reinitialization FAILED");
+  }
+
+  return canbusready;
+}
+
+// Check CAN health and reinitialize if needed
+void checkCANHealth() {
+  twai_status_info_t status_info;
+  twai_get_status_info(&status_info);
+
+  // Check for bus-off or stopped state (indicates power loss or severe error)
+  if (status_info.state == TWAI_STATE_BUS_OFF ||
+      status_info.state == TWAI_STATE_STOPPED) {
+    Serial.println("[CAN] Bus error detected - attempting recovery...");
+    reinitCAN();
+  }
+  // Check for high error counts (indicates communication issues)
+  else if (status_info.tx_error_counter > 127 || status_info.rx_error_counter > 127) {
+    Serial.printf("[CAN] High error count (TX:%d, RX:%d) - reinitializing...\n",
+                  status_info.tx_error_counter, status_info.rx_error_counter);
+    reinitCAN();
+  }
 }
 
 // ============================================================================
