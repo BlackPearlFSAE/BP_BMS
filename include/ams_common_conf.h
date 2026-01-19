@@ -5,7 +5,7 @@
 
 // Cell Configuration 
 #define CELL_NUM 10
-#define BMU_NUM 8
+#define BMU_NUM 4
 // #define BMU_NUM 2 // Test config
 // #define BMU_NUM 0 // Headless config
 
@@ -23,7 +23,7 @@
 
 // AMS Communication
 #define STANDARD_BIT_RATE TWAI_TIMING_CONFIG_250KBITS()
-#define DISCONNENCTION_TIMEOUT 1000
+#define DISCONNENCTION_TIMEOUT 1500
 #define OBC_COMMUNICATE_TIME  500
 #define BMS_COMMUNICATE_TIME  1000
 #define BCU_ADD 0x18000000

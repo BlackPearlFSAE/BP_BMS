@@ -76,6 +76,7 @@ unsigned long canHealthCheckInterval = 5000; // Check CAN health every 5 seconds
 
 /**************** Local Function Declaration *******************/
 void readAllCells();
+void balanceCells();
 void packBMU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id);
 void packBMU_MSG2_CellsLowSeries(twai_message_t* msg, uint32_t id);
 void packBMU_MSG3_CellsHighSeries(twai_message_t* msg, uint32_t id);
@@ -122,10 +123,9 @@ void loop() {
   }
   readAllCells();
   if(BMU_ReadyToCharge) balanceCells(); 
+  int ModuleNum = 3;  // TODO: Set from EEPROM or DIP switch
   // ======== Cell Data Transmission (1000ms interval) ========
   if(SESSION_TIME - prevMillis >= intervalMillis){
-    int ModuleNum = 1;  // TODO: Set from EEPROM or DIP switch
-
     // BMU MSG 1: Operation Status (Priority=2, Msg=1)
     uint32_t bmu_id_msg1 = createExtendedCANID(2, ModuleNum, 1);
     packBMU_MSG1_OperationStatus(&tx_message, bmu_id_msg1);
@@ -150,26 +150,24 @@ void loop() {
     prevMillis = millis();
   }
 
-  // ======== Fault Code Transmission (1300ms interval) ========
-  if(SESSION_TIME - prevFaultMillis >= faultIntervalMillis){
-    int ModuleNum = 1;  // TODO: Set from EEPROM or DIP switch
+  // // ======== Fault Code Transmission (1300ms interval) ========
+  // if(SESSION_TIME - prevFaultMillis >= faultIntervalMillis){
+  //   // BMU MSG 4: Fault Code 1 - OV/LV (Priority=1, Msg=1)
+  //   uint32_t bmu_id_fault1 = createExtendedCANID(1, ModuleNum, 1);
+  //   packBMU_MSG4_FaultCode1(&tx_message, bmu_id_fault1);
+  //   if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
+  //     Serial.println("CAN TX failed: MSG4 Fault Code 1");
+  //   }
 
-    // BMU MSG 4: Fault Code 1 - OV/LV (Priority=1, Msg=1)
-    uint32_t bmu_id_fault1 = createExtendedCANID(1, ModuleNum, 1);
-    packBMU_MSG4_FaultCode1(&tx_message, bmu_id_fault1);
-    if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
-      Serial.println("CAN TX failed: MSG4 Fault Code 1");
-    }
+  //   // BMU MSG 5: Fault Code 2 - Temp/DV (Priority=1, Msg=2)
+  //   uint32_t bmu_id_fault2 = createExtendedCANID(1, ModuleNum, 2);
+  //   packBMU_MSG5_FaultCode2(&tx_message, bmu_id_fault2);
+  //   if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
+  //     Serial.println("CAN TX failed: MSG5 Fault Code 2");
+  //   }
 
-    // BMU MSG 5: Fault Code 2 - Temp/DV (Priority=1, Msg=2)
-    uint32_t bmu_id_fault2 = createExtendedCANID(1, ModuleNum, 2);
-    packBMU_MSG5_FaultCode2(&tx_message, bmu_id_fault2);
-    if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
-      Serial.println("CAN TX failed: MSG5 Fault Code 2");
-    }
-
-    prevFaultMillis = millis();
-  }
+  //   prevFaultMillis = millis();
+  // }
 }
 
 // ============================================================================

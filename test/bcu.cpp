@@ -20,10 +20,8 @@
 #include "helper.h"
 
 /************************* Pin Definitions ***************************/
-// #define CAN_TX_PIN 20
-// #define CAN_RX_PIN 21
-#define CAN_TX_PIN 48
-#define CAN_RX_PIN 47
+#define CAN_TX_PIN 20
+#define CAN_RX_PIN 21
 #define OBCIN        9   // Charger plug detect input
 #define AMS_OUT      2  // AMS OK output signal
 
@@ -133,10 +131,9 @@ void setup() {
 }
 
 /************************* Main Loop ***************************/
-uint32_t debug_timer = 0;
 void loop() {
   unsigned long SESSION_TIME = millis();
-  CHARGER_PLUGGED = false; // Will Use digitalRead(OBCIN) for actual charger detection later 
+  CHARGER_PLUGGED = false; // Will Use digitalRead(OBCIN) for actual charger detection later
 
   // CAN TX: BCU broadcast to BMUs
   if (CAN_SEND_FLG1) {
@@ -152,27 +149,27 @@ void loop() {
     CAN32_sendCAN(&chargerMsg, canbusready);
   }
 
-  // CAN RX processing
-  if (CAN32_receiveCAN(&receivedMsg, canbusready) == ESP_OK) {
+  // CAN RX processing - drain all pending messages from queue
+  while (CAN32_receiveCAN(&receivedMsg, canbusready) == ESP_OK) {
     processReceived_BMUmsg(&receivedMsg, BMU_Package);
-    if (CHARGER_PLUGGED) processReceived_OBCmsg(&chargerMsg);
-
-    // Reset AMS before recalculating
-    AMS_Package = AMSdata();
-    // Update BMU connection status and aggregate to AMS
-    for (int j = 0; j < BMU_NUM; j++) {
-      if (isModuleActive(j)) {
-        BMU_Package[j].BMUconnected = true;
-        packing_AMSstruct(j);
-      } else {
-        BMU_Package[j].BMUconnected = false;
-      }
-    }
+    if (CHARGER_PLUGGED) processReceived_OBCmsg(&receivedMsg);
     CAN_TIMEOUT_FLG = false;
     Sustained_Communicate_Time = millis();
   }
+
+  // Update BMU connection status and aggregate to AMS
+  AMS_Package = AMSdata();
+  for (int j = 0; j < BMU_NUM; j++) {
+    if (isModuleActive(j)) {
+      BMU_Package[j].BMUconnected = true;
+      packing_AMSstruct(j);
+    } else {
+      BMU_Package[j].BMUconnected = false;
+    }
+  }
+
   // CAN bus timeout - complete disconnect
-  else if (SESSION_TIME - Sustained_Communicate_Time >= DISCONNENCTION_TIMEOUT) {
+  if (SESSION_TIME - Sustained_Communicate_Time >= DISCONNENCTION_TIMEOUT) {
     digitalWrite(AMS_OUT, LOW);
     Serial.println("NO_BYTE_RECV");
     delay(500);
@@ -180,25 +177,18 @@ void loop() {
     CAN_TIMEOUT_FLG = true;
     return;
   }
-  if(SESSION_TIME - debug_timer >= 500){
-    debugBMUMod(1);
-    debug_timer = millis();
-  }
-  
-  
+  debugBMUMod(1);
   // Check for individual BMU disconnection
-  // if (!checkModuleDisconnect(BMU_Package)) {
-  //   digitalWrite(AMS_OUT, LOW);
-  //   Serial.println("THE_FOLLOWING_BMU_ARE_DISCONNECTED -- Please connect before operate:");
-  //   for (int i = 0; i < BMU_NUM; i++) {
-  //     if (!BMU_Package[i].BMUconnected)
-  //       Serial.printf("BMU Module no.%d \n\n", i + 1);
-  //   }
-  //   delay(500);
-  //   return;
-  // }
-
-  return;
+  if (!checkModuleDisconnect(BMU_Package)) {
+    digitalWrite(AMS_OUT, LOW);
+    Serial.println("THE_FOLLOWING_BMU_ARE_DISCONNECTED -- Please connect before operate:");
+    for (int i = 0; i < BMU_NUM; i++) {
+      if (!BMU_Package[i].BMUconnected)
+        Serial.printf("BMU Module no.%d \n\n", i + 1);
+    }
+    delay(500);
+    return;
+  }
 
   /*=============== AMS_OK Determination ===============*/
 
@@ -276,10 +266,10 @@ void processReceived_BMUmsg(twai_message_t *receivedframe, BMUdata *BMU_Package)
   decodeExtendedCANID(&decodedCANID, receivedframe->identifier);
 
   int i = decodedCANID.SRC - 1;
-  if (i >= BMU_NUM) return;
+  if (i < 0 || i >= BMU_NUM) return;  // Added lower bound check
 
   lastModuleResponse[i] = millis();
-  BMU_Package[i].BMU_ID = receivedframe->identifier;
+
   // Priority 0x02: BMU module & cell data
   if (decodedCANID.PRIORITY == 0x02) {
     switch (decodedCANID.MSG_NUM) {
@@ -381,6 +371,7 @@ void debugAMSstate() {
   Serial.printf("OV_DIV_CRT: %d\n", ACCUM_OverDivCritical);
   Serial.printf("OV_DIV_WARN: %d\n", ACCUM_OverDivWarn);
 }
+
 
 void debugBMUMod(int moduleNum) {
   Serial.printf("BMU ID: %X\n", BMU_Package[moduleNum].BMU_ID);

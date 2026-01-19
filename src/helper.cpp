@@ -113,7 +113,6 @@ void decodeExtendedCANID(struct extCANIDDecoded *myCAN, uint32_t canID) {
     myCAN->BASE_ID = (canID >> 24) & 0xFF;         // 0x18
     myCAN->PRIORITY = (canID >> 20) & 0x0F;        // Priority nibble
     myCAN->SRC = (canID >> 16) & 0x0F;             // SRC_ADDRESS number (1-8)
-    myCAN->DEST = (canID >> 8) & 0xFF;             // Reserved (0x00)
     myCAN->MSG_NUM = canID & 0x0F;                 // Message number
 }
 
