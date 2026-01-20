@@ -253,11 +253,6 @@ void loop() {
   /*==================== AMS_OK Determination ====================*/
 
   // Voltage fault flags
-  // OVER_VOLT_CRIT = (AMS_Package.ACCUM_VOLTAGE >= ACCUM_MAXVOLTAGE);
-  // ACCUM_FULL = (AMS_Package.ACCUM_VOLTAGE >= 0.9f * ACCUM_MAXVOLTAGE);
-  // LOW_VOLT_CRIT = (AMS_Package.ACCUM_VOLTAGE <= ACCUM_MINVOLTAGE);
-  // LOW_VOLT_WARN = (AMS_Package.ACCUM_VOLTAGE <= 1.10f * ACCUM_MINVOLTAGE);
-
   ACCUM_FULL = (AMS_Package.ACCUM_VOLTAGE >= 0.95f * ACCUM_MAXVOLTAGE);
   ACCUM_LOW = (AMS_Package.ACCUM_VOLTAGE >= 1.12f * ACCUM_MINVOLTAGE);
   OVER_VOLT_CRIT = (AMS_Package.OVERVOLT_CRITICAL > 0);
