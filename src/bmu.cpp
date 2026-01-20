@@ -7,6 +7,7 @@
 #include "CAN32_util.h"
 #include "ams_common_conf.h"
 #include "helper.h"
+#include "ntstermistor.h"
 
 // Example to write for filter -> Make it an output of twai_filter_config_t type , to get the data strcuture need
 
@@ -30,8 +31,8 @@
 bool BMU_ReadyToCharge = false;              // Byte 0: Module ready to charge
 uint16_t BalancingDischarge_Cells = 0x0000;  // Byte 1-2: 10-bit cell balancing status
 uint8_t DV_raw = 0;                          // Byte 3: Delta V (factor 0.1V)
-uint8_t TempSensor1_raw = 200;               // Byte 4: Temp sensor 1 (offset 2, factor 0.0125)
-uint8_t TempSensor2_raw = 200;               // Byte 5: Temp sensor 2
+// uint8_t TempSensor1_raw = 0;               // Byte 4: Temp sensor 1 (offset 2, factor 0.0125)
+// uint8_t TempSensor2_raw = 0;// Byte 5: Temp sensor 2
 
 // BMU MSG 4 & 5 Fault flags (10-bit per fault type, each bit = 1 cell)
 uint16_t OVERVOLTAGE_WARNING = 0x0000;       // Bytes 0-1
@@ -43,6 +44,10 @@ uint16_t OVERTEMP_CRITICAL = 0x0000;         // Bytes 2-3 (MSG5)
 uint16_t OVERDIV_WARNING = 0x0000;           // Bytes 4-5 (MSG5)
 uint16_t OVERDIV_CRITICAL = 0x0000;          // Bytes 6-7 (MSG5)
 
+
+
+
+
 //CAN section
 twai_message_t tx_message;
 twai_message_t rx_message;
@@ -51,6 +56,8 @@ twai_message_t rx_message;
 #define TOTAL_IC    1
 #define NUM_CELLS   10
 #define CS_PIN      7
+#define TEMP_SENSOR1_PIN A0
+#define TEMP_SENSOR2_PIN A1
 cell_asic bms_ic[TOTAL_IC];
 float cellvoltages[NUM_CELLS];
 
@@ -77,7 +84,7 @@ unsigned long canHealthCheckInterval = 5000; // Check CAN health every 5 seconds
 /**************** Local Function Declaration *******************/
 void readAllCells();
 void balanceCells();
-void packBMU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id);
+void packBMU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id,uint8_t temp1,uint8_t temp2);
 void packBMU_MSG2_CellsLowSeries(twai_message_t* msg, uint32_t id);
 void packBMU_MSG3_CellsHighSeries(twai_message_t* msg, uint32_t id);
 void packBMU_MSG4_FaultCode1(twai_message_t* msg, uint32_t id);
@@ -85,10 +92,12 @@ void packBMU_MSG5_FaultCode2(twai_message_t* msg, uint32_t id);
 void processBCUConfigMsg(twai_message_t* msg);
 void debugConfig();
 
+float getTemp(int pin,int print);
 void balanceCells();
 bool reinitCAN();
 void checkCANHealth();
 
+uint8_t encode_temp(float temp_c);
 
 /*******************************************************************
   ==============================Setup==============================
@@ -120,7 +129,9 @@ void setup() {
 void loop() {
     // TODO: Set from EEPROM or DIP switch
   uint32_t SESSION_TIME = millis();
-
+  uint8_t temp1 = getTemp(TEMP_SENSOR1_PIN,1);
+  uint8_t temp2 = getTemp(TEMP_SENSOR2_PIN,0);
+; // Example temperature reading
   // Periodic CAN health check and recovery
   if (SESSION_TIME - lastCANHealthCheck >= canHealthCheckInterval) {
     checkCANHealth();
@@ -132,15 +143,27 @@ void loop() {
     while (CAN32_receiveCAN(&rx_message) == ESP_OK)
     processBCUConfigMsg(&rx_message);
   }
+
   readAllCells();
-  if(BMU_ReadyToCharge) balanceCells(); 
-  int ModuleNum = 1;
+
+  if(BMU_ReadyToCharge) {
+    balanceCells(); 
+  }
+
+  int ModuleNum = 5;
   // ======== Cell Data Transmission (1000ms interval) ========
   if(SESSION_TIME - prevMillis >= intervalMillis){
+    // Serial.print("TEMP : ");
+    // Serial.println(temp);
+    // for (int i = 0; i < NUM_CELLS; i++) {
+    //   Serial.print("Cell "); Serial.print(i + 1); 
+    //   Serial.print(": "); Serial.print(cellvoltages[i], 4);
+    //   Serial.println(" V");
+    // }
 
     // BMU MSG 1: Operation Status (Priority=2, Msg=1)
     uint32_t bmu_id_msg1 = createExtendedCANID(2, ModuleNum, 1);
-    packBMU_MSG1_OperationStatus(&tx_message, bmu_id_msg1);
+    packBMU_MSG1_OperationStatus(&tx_message, bmu_id_msg1,temp1,temp2);
     if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
       Serial.println("CAN TX failed: MSG1 Operation Status");
     }
@@ -164,29 +187,62 @@ void loop() {
   
   // TODO: Set from EEPROM or DIP switch
   // ======== Fault Code Transmission (1300ms interval) ========
-  // if(SESSION_TIME - prevFaultMillis >= faultIntervalMillis){
+  if(SESSION_TIME - prevFaultMillis >= faultIntervalMillis){
+    // BMU MSG 4: Fault Code 1 - OV/LV (Priority=1, Msg=1)
+    uint32_t bmu_id_fault1 = createExtendedCANID(1, ModuleNum, 1);
+    packBMU_MSG4_FaultCode1(&tx_message, bmu_id_fault1);
+    if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
+      Serial.println("CAN TX failed: MSG4 Fault Code 1");
+    }
 
-  //   // BMU MSG 4: Fault Code 1 - OV/LV (Priority=1, Msg=1)
-  //   uint32_t bmu_id_fault1 = createExtendedCANID(1, ModuleNum, 1);
-  //   packBMU_MSG4_FaultCode1(&tx_message, bmu_id_fault1);
-  //   if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
-  //     Serial.println("CAN TX failed: MSG4 Fault Code 1");
-  //   }
+    // BMU MSG 5: Fault Code 2 - Temp/DV (Priority=1, Msg=2)
+    uint32_t bmu_id_fault2 = createExtendedCANID(1, ModuleNum, 2);
+    packBMU_MSG5_FaultCode2(&tx_message, bmu_id_fault2);
+    if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
+      Serial.println("CAN TX failed: MSG5 Fault Code 2");
+    }
 
-  //   // BMU MSG 5: Fault Code 2 - Temp/DV (Priority=1, Msg=2)
-  //   uint32_t bmu_id_fault2 = createExtendedCANID(1, ModuleNum, 2);
-  //   packBMU_MSG5_FaultCode2(&tx_message, bmu_id_fault2);
-  //   if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
-  //     Serial.println("CAN TX failed: MSG5 Fault Code 2");
-  //   }
-
-  //   prevFaultMillis = millis();
-  // }
+    prevFaultMillis = millis();
+  }
 }
 
 // ============================================================================
 // LTC6811 function
 // ============================================================================
+float getTemp(int pin, int print) {
+  
+  while (print == 1){
+    Serial.print("tempC pin ");
+    Serial.print(pin);
+    Serial.print(": ");
+    Serial.println(resistance_to_celsius(read_ntc_resistance(pin)));
+    print = 0;
+  }
+  
+  return resistance_to_celsius(read_ntc_resistance(pin));
+}
+
+// float getTemp(int pin,int print) {
+//   float voltage = analogRead(pin) * (3.3 / 4095.0);
+
+//   float a = 18.26 * voltage;
+//   float b = 0.143 * voltage;
+
+//   float aa = a - 67.8;
+//   float bb = b - 0.713;
+
+//   float tempC = aa / bb;
+
+//   while (print == 1){
+//     Serial.print("tempC pin ");
+//     Serial.print(pin);
+//     Serial.print(": ");
+//     Serial.println(tempC);
+//   }
+
+//   return tempC;
+// }
+
 
 void readAllCells(){
   wakeup_sleep(TOTAL_IC);
@@ -249,7 +305,17 @@ void checkCANHealth() {
 // ============================================================================
 // Message Packing
 // ============================================================================
-
+uint8_t encode_temp(float temp_c) {
+    // Clamp to valid range first
+    if (temp_c < -40.0f) temp_c = -40.0f;
+    if (temp_c > 87.5f) temp_c = 87.5f;
+    
+    // Apply formula
+    float scaled = (temp_c + 40.0f) * 2.0f;
+    
+    // Round and convert to byte
+    return (uint8_t)(scaled + 0.5f);  // +0.5 for rounding
+}
 // BMU MSG 1: Module Operation & Voltage Status (Priority=2, Msg=1)
 // Byte 0: BMU Enter Charging Mode (0=NO, 1=YES)
 // Byte 1-2: Cells in Balancing (10-bit, MSB first)
@@ -257,7 +323,7 @@ void checkCANHealth() {
 // Byte 4: Temp Sensor 1 (offset 2, factor 0.0125)
 // Byte 5: Temp Sensor 2 (offset 2, factor 0.0125)
 // Byte 6-7: Reserved
-void packBMU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id) {
+void packBMU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id, uint8_t temp1, uint8_t temp2) {
   msg->identifier = id;
   msg->extd = 1;  // Extended CAN ID
   msg->rtr = 0;
@@ -267,8 +333,8 @@ void packBMU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id) {
   msg->data[1] = (BalancingDischarge_Cells >> 8) & 0xFF;  // High byte
   msg->data[2] = BalancingDischarge_Cells & 0xFF;         // Low byte
   msg->data[3] = DV_raw;
-  msg->data[4] = TempSensor1_raw;
-  msg->data[5] = TempSensor2_raw;
+  msg->data[4] = encode_temp(temp1);
+  msg->data[5] = encode_temp(temp2);
   msg->data[6] = 0x00;  // Reserved
   msg->data[7] = 0x00;  // Reserved
 }
