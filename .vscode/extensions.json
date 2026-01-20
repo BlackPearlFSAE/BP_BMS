@@ -2,8 +2,6 @@
     // See http://go.microsoft.com/fwlink/?LinkId=827846
     // for the documentation about the extensions.json format
     "recommendations": [
-        "asvetliakov.vscode-neovim",
-        "hoovercj.vscode-power-mode",
         "platformio.platformio-ide"
     ],
     "unwantedRecommendations": [

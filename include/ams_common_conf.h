@@ -5,8 +5,8 @@
 
 // Cell Configuration 
 #define CELL_NUM 10
-#define BMU_NUM 4
-// #define BMU_NUM 2 // Test config
+// #define BMU_NUM 4
+#define BMU_NUM 2 // Test config
 // #define BMU_NUM 0 // Headless config
 
 /*LG34 Battery*/
@@ -23,9 +23,9 @@
 
 // AMS Communication
 #define STANDARD_BIT_RATE TWAI_TIMING_CONFIG_250KBITS()
-#define DISCONNENCTION_TIMEOUT 1500
 #define OBC_COMMUNICATE_TIME  500
 #define BMS_COMMUNICATE_TIME  1000
+#define DISCONNENCTION_TIMEOUT BMS_COMMUNICATE_TIME * 1.5
 #define BCU_ADD 0x18000000
 #define OBC_ADD 0x1806E5F4
 
@@ -34,7 +34,7 @@ struct BMUdata {
   uint32_t BMU_ID = 0x00; 
   uint8_t V_CELL[CELL_NUM] = {0};
   uint8_t TEMP_SENSE[TEMP_SENSOR_NUM] = {0};
-  uint8_t V_MODULE = 0;
+  uint16_t V_MODULE = 0;
   uint8_t DV = 0;
   // FaultCode 10 bit binary representation of C
   uint16_t OVERVOLTAGE_WARNING = 0;

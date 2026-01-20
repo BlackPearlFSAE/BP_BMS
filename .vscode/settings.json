@@ -3,13 +3,11 @@
     "array": "cpp",
     "string": "cpp",
     "string_view": "cpp",
-
     "cstring": "cpp",
     "*.tcc": "cpp",
     "iostream": "cpp",
     "typeinfo": "cpp",
-    "stdexcept": "cpp"
-  }
+    "stdexcept": "cpp",
     "locale": "cpp",
     "bitset": "cpp",
     "deque": "cpp",

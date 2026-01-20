@@ -1,6 +1,12 @@
-/* BCU - Battery Control Unit
+/* BCU - Battery Control Unit (Refactored)
  * Handles CAN communication with BMU modules and OBC charger
  * Determines AMS_OK status based on fault conditions
+ *
+ * Key fixes from bcu_issues_analysis.md:
+ * - Separate CAN RX (drain queue) from data aggregation
+ * - Periodic aggregation every 500ms instead of per-message
+ * - V_MODULE calculated once during aggregation, not per-message
+ * - Proper lastModuleResponse[] initialization
  */
 
 /************************* Includes ***************************/
@@ -20,41 +26,44 @@
 #include "helper.h"
 
 /************************* Pin Definitions ***************************/
-#define CAN_TX_PIN 20
-#define CAN_RX_PIN 21
+#define CAN_TX_PIN 48
+#define CAN_RX_PIN 47
 #define OBCIN        9   // Charger plug detect input
-#define AMS_OUT      2  // AMS OK output signal
+#define AMS_OUT      2   // AMS OK output signal
 
 /************************* Global Variables ***************************/
-// CAN messages
+
+/*--- CAN Messages ---*/
 twai_message_t sendMsg;
 twai_message_t receivedMsg;
 twai_message_t chargerMsg;
 bool canbusready = false;
 
-// Timing
+/*--- Timing ---*/
 unsigned long reference_time = 0;
 unsigned long Sustained_Communicate_Time = 0;
 unsigned long shutdown_timer = 0;
 unsigned long lastModuleResponse[BMU_NUM];
 unsigned long logCount = 0;
 unsigned long lastlogtime = 0;
+unsigned long aggregation_timer = 0;  // NEW: For periodic AMS aggregation
+unsigned long debug_timer = 0;
 
-// Hardware timers
+/*--- Hardware Timers ---*/
 hw_timer_t *My_timer1 = NULL;
 hw_timer_t *My_timer2 = NULL;
 
-// Data structures
+/*--- Data Structures ---*/
 BMUdata BMU_Package[BMU_NUM];
 AMSdata AMS_Package;
 OBCdata OBC_Package;
 
-// Aliases for cleaner access
+/*--- Aliases for Cleaner Access ---*/
 bool &AMS_OK = AMS_Package.AMS_OK;
 float &ACCUM_MAXVOLTAGE = AMS_Package.ACCUM_MAXVOLTAGE;
 float &ACCUM_MINVOLTAGE = AMS_Package.ACCUM_MINVOLTAGE;
 
-// Flags
+/*--- Flags ---*/
 volatile bool CAN_SEND_FLG1 = false;
 volatile bool CAN_SEND_FLG2 = false;
 bool CHARGER_PLUGGED = false;
@@ -69,8 +78,7 @@ bool LOW_VOLT_WARN = false;
 bool OVER_VOLT_CRIT = false;
 bool ACCUM_FULL = false;
 
-// Default BMU parameters (Can change Later)
-
+/*--- BMU Parameters (Configurable) ---*/
 int transimission_time = BMS_COMMUNICATE_TIME;
 float VmaxCell = VMAX_CELL;
 float VminCell = VMIN_CELL;
@@ -80,23 +88,23 @@ bool BMUUpdateFlag = 0;
 
 /************************* Function Declarations ***************************/
 void packBCU_toAMSmsg(twai_message_t *BCUsent, uint16_t bcu_transimission_time, bool &is_charger_plugged);
-void packBCU_toOBCmsg(twai_message_t *BCUsent, bool &BMS_OK, bool &ReadytoCharge, bool &OverDivCritical_Yes, bool &Voltage_is_Full);
+void packBCU_toOBCmsg(twai_message_t *BCUsent, bool &AMS_OK, bool &ReadytoCharge, bool &OverDivCritical_Yes, bool &Voltage_is_Full);
 void processReceived_OBCmsg(twai_message_t *receivedframe);
 void processReceived_BMUmsg(twai_message_t *receivedframe, BMUdata *BMS_ROSPackage);
+void aggregateAMSdata();
+void packing_AMSstruct(int moduleIndex);
+bool isModuleActive(int moduleIndex);
+bool checkModuleDisconnect(BMUdata *BMU_Package);
+void resetAllStruct();
 void debugAMSstate();
 void debugBMUMod(int moduleNum);
 void debugOBCmsg();
-bool checkModuleDisconnect(BMUdata *BMU_Package);
-void resetAllStruct();
-bool isModuleActive(int moduleIndex);
-void resetModuleData(int moduleIndex);
-void packing_AMSstruct(int moduleIndex);
-void dynamicModulereset(BMUdata *BMU_Package);
 
 /************************* Timer ISRs ***************************/
 void IRAM_ATTR onTimer_dischargeMode() {
   CAN_SEND_FLG1 = true;
 }
+
 void IRAM_ATTR onTimer_chargeMode() {
   CAN_SEND_FLG2 = true;
 }
@@ -110,22 +118,31 @@ void setup() {
   pinMode(OBCIN, INPUT_PULLDOWN);
   pinMode(AMS_OUT, OUTPUT);
 
+  // Initialize lastModuleResponse to 0 (modules will appear inactive until they respond)
+  for (int i = 0; i < BMU_NUM; i++) {
+    lastModuleResponse[i] = 0;
+  }
+
   // CAN bus init
   twai_filter_config_t filter_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
   canbusready = CAN32_initCANBus(CAN_TX_PIN, CAN_RX_PIN, STANDARD_BIT_RATE, filter_config);
   sendMsg.extd = receivedMsg.extd = chargerMsg.extd = true;
 
-  // Timer 1: Discharge mode (1000ms)
+  // Timer 1: Discharge mode broadcast (1000ms)
   My_timer1 = timerBegin(0, 80, true);
   timerAttachInterrupt(My_timer1, &onTimer_dischargeMode, true);
   timerAlarmWrite(My_timer1, BMS_COMMUNICATE_TIME * 1000, true);
   timerAlarmEnable(My_timer1);
 
-  // Timer 2: Charge mode (500ms)
+  // Timer 2: Charge mode broadcast (500ms)
   My_timer2 = timerBegin(1, 80, true);
   timerAttachInterrupt(My_timer2, &onTimer_chargeMode, true);
   timerAlarmWrite(My_timer2, OBC_COMMUNICATE_TIME * 1000, true);
   timerAlarmEnable(My_timer2);
+
+  // Initialize timers
+  Sustained_Communicate_Time = millis();
+  aggregation_timer = millis();
 
   Serial.println("BCU__initialized__");
 }
@@ -133,61 +150,63 @@ void setup() {
 /************************* Main Loop ***************************/
 void loop() {
   unsigned long SESSION_TIME = millis();
-  CHARGER_PLUGGED = false; // Will Use digitalRead(OBCIN) for actual charger detection later
+  CHARGER_PLUGGED = false; // TODO: Use digitalRead(OBCIN) for actual charger detection
 
-  // CAN TX: BCU broadcast to BMUs
+  /*=============== CAN TX: BCU Broadcasts ===============*/
+
+  // Broadcast to BMUs (every 1000ms)
   if (CAN_SEND_FLG1) {
     CAN_SEND_FLG1 = false;
     packBCU_toAMSmsg(&sendMsg, BMS_COMMUNICATE_TIME, CHARGER_PLUGGED);
     CAN32_sendCAN(&sendMsg, canbusready);
   }
 
-  // CAN TX: BCU to OBC (only when charging)
+  // Broadcast to OBC when charging (every 500ms)
   if (CAN_SEND_FLG2 && CHARGER_PLUGGED) {
     CAN_SEND_FLG2 = false;
     packBCU_toOBCmsg(&chargerMsg, AMS_OK, ACCUM_ReadytoCharge, ACCUM_OverDivCritical, ACCUM_FULL);
     CAN32_sendCAN(&chargerMsg, canbusready);
   }
 
-  // CAN RX processing - drain all pending messages from queue
+  /*=============== CAN RX: Drain Queue, Store Data Only ===============*/
+  // Process ALL pending CAN messages (lightweight - just store data)
   while (CAN32_receiveCAN(&receivedMsg, canbusready) == ESP_OK) {
     processReceived_BMUmsg(&receivedMsg, BMU_Package);
-    if (CHARGER_PLUGGED) processReceived_OBCmsg(&receivedMsg);
-    CAN_TIMEOUT_FLG = false;
-    Sustained_Communicate_Time = millis();
-  }
-
-  // Update BMU connection status and aggregate to AMS
-  AMS_Package = AMSdata();
-  for (int j = 0; j < BMU_NUM; j++) {
-    if (isModuleActive(j)) {
-      BMU_Package[j].BMUconnected = true;
-      packing_AMSstruct(j);
-    } else {
-      BMU_Package[j].BMUconnected = false;
+    if (CHARGER_PLUGGED) {
+      processReceived_OBCmsg(&receivedMsg);
     }
+    Sustained_Communicate_Time = millis();
+    CAN_TIMEOUT_FLG = false;
   }
 
-  // CAN bus timeout - complete disconnect
+  /*=============== CAN Timeout Check ===============*/
   if (SESSION_TIME - Sustained_Communicate_Time >= DISCONNENCTION_TIMEOUT) {
     digitalWrite(AMS_OUT, LOW);
-    Serial.println("NO_BYTE_RECV");
-    delay(500);
-    if (!CAN_TIMEOUT_FLG) resetAllStruct();
+
+    if (SESSION_TIME - shutdown_timer >= 500) {
+      Serial.println("NO_BYTE_RECV");
+      shutdown_timer = millis();
+    }
+    if (!CAN_TIMEOUT_FLG) {
+      resetAllStruct();
+    }
     CAN_TIMEOUT_FLG = true;
     return;
   }
-  debugBMUMod(1);
-  // Check for individual BMU disconnection
-  if (!checkModuleDisconnect(BMU_Package)) {
-    digitalWrite(AMS_OUT, LOW);
-    Serial.println("THE_FOLLOWING_BMU_ARE_DISCONNECTED -- Please connect before operate:");
-    for (int i = 0; i < BMU_NUM; i++) {
-      if (!BMU_Package[i].BMUconnected)
-        Serial.printf("BMU Module no.%d \n\n", i + 1);
+
+  /*=============== Periodic Aggregation (every 500ms) ===============*/
+  if (SESSION_TIME - aggregation_timer >= 500) {
+    aggregateAMSdata();
+    aggregation_timer = SESSION_TIME;
+  }
+
+  /*=============== Debug Output (every 500ms) ===============*/
+  if (SESSION_TIME - debug_timer >= 500) {
+    for (int j = 0; j < BMU_NUM; j++) {
+      Serial.printf("BMU ID: %X ", BMU_Package[j].BMU_ID);
+      Serial.printf("Connect %X\n", BMU_Package[j].BMUconnected);
     }
-    delay(500);
-    return;
+    debug_timer = millis();
   }
 
   /*=============== AMS_OK Determination ===============*/
@@ -222,6 +241,7 @@ void loop() {
 }
 
 /************************* CAN Message Packing ***************************/
+
 void packBCU_toAMSmsg(twai_message_t *BCUsent, uint16_t bcu_transimission_time, bool &is_charger_plugged) {
   uint8_t* transmission_time = splitHLbyte(bcu_transimission_time);
   BCUsent->identifier = BCU_ADD;
@@ -229,12 +249,13 @@ void packBCU_toAMSmsg(twai_message_t *BCUsent, uint16_t bcu_transimission_time, 
   BCUsent->data[0] = transmission_time[0];
   BCUsent->data[1] = transmission_time[0];
   BCUsent->data[2] = is_charger_plugged ? 1 : 0;
-  BCUsent->data[3] = (uint8_t) VmaxCell / 0.1;
-  BCUsent->data[4] = (uint8_t) VminCell / 0.1;
-  BCUsent->data[5] = (byte) TempMaxCell;
-  BCUsent->data[6] = (byte) dVmax / 0.1;
+  BCUsent->data[3] = (uint8_t)(VmaxCell / 0.1);
+  BCUsent->data[4] = (uint8_t)(VminCell / 0.1);
+  BCUsent->data[5] = (byte)TempMaxCell;
+  BCUsent->data[6] = (byte)(dVmax / 0.1);
   BCUsent->data[7] = BMUUpdateFlag;
 }
+
 void packBCU_toOBCmsg(twai_message_t *BCUsent, bool &AMS_OK, bool &ReadytoCharge, bool &OverDivCritical_Yes, bool &Voltage_is_Full) {
   BCUsent->identifier = OBC_ADD;
   BCUsent->data_length_code = 8;
@@ -259,16 +280,19 @@ void packBCU_toOBCmsg(twai_message_t *BCUsent, bool &AMS_OK, bool &ReadytoCharge
 }
 
 /************************* CAN Message Processing ***************************/
-void processReceived_BMUmsg(twai_message_t *receivedframe, BMUdata *BMU_Package) {
-  dynamicModulereset(BMU_Package);
 
+void processReceived_BMUmsg(twai_message_t *receivedframe, BMUdata *BMU_Package) {
   extCANIDDecoded decodedCANID;
   decodeExtendedCANID(&decodedCANID, receivedframe->identifier);
 
   int i = decodedCANID.SRC - 1;
-  if (i < 0 || i >= BMU_NUM) return;  // Added lower bound check
+  if (i < 0 || i >= BMU_NUM) return;
 
+  // Update timestamp and ID
   lastModuleResponse[i] = millis();
+  BMU_Package[i].BMU_ID = receivedframe->identifier;
+
+  // NOTE: V_MODULE is NOT reset here - it's calculated during aggregation
 
   // Priority 0x02: BMU module & cell data
   if (decodedCANID.PRIORITY == 0x02) {
@@ -276,18 +300,21 @@ void processReceived_BMUmsg(twai_message_t *receivedframe, BMUdata *BMU_Package)
       case 1:  // Operation status
         BMU_Package[i].BMUreadytoCharge = receivedframe->data[0];
         BMU_Package[i].BalancingDischarge_Cells = mergeHLbyte(receivedframe->data[1], receivedframe->data[2]);
-        BMU_Package[i].V_MODULE = mergeHLbyte(receivedframe->data[3], receivedframe->data[4]);
-        BMU_Package[i].DV = receivedframe->data[5];
-        BMU_Package[i].TEMP_SENSE[0] = receivedframe->data[6];
-        BMU_Package[i].TEMP_SENSE[1] = receivedframe->data[7];
+        BMU_Package[i].DV = receivedframe->data[3];
+        BMU_Package[i].TEMP_SENSE[0] = receivedframe->data[4];
+        BMU_Package[i].TEMP_SENSE[1] = receivedframe->data[5];
         break;
+
       case 2:  // Cell voltages C1-C8
-        for (short j = 0; j < 8; j++)
+        for (short j = 0; j < 8; j++) {
           BMU_Package[i].V_CELL[j] = receivedframe->data[j];
+        }
         break;
+
       case 3:  // Cell voltages C9-C10
-        for (short j = 8; j < CELL_NUM; j++)
+        for (short j = 8; j < CELL_NUM; j++) {
           BMU_Package[i].V_CELL[j] = receivedframe->data[j - 8];
+        }
         break;
     }
   }
@@ -300,6 +327,7 @@ void processReceived_BMUmsg(twai_message_t *receivedframe, BMUdata *BMU_Package)
         BMU_Package[i].LOWVOLTAGE_WARNING = mergeHLbyte(receivedframe->data[4], receivedframe->data[5]);
         BMU_Package[i].LOWVOLTAGE_CRITICAL = mergeHLbyte(receivedframe->data[6], receivedframe->data[7]);
         break;
+
       case 2:
         BMU_Package[i].OVERTEMP_WARNING = mergeHLbyte(receivedframe->data[0], receivedframe->data[1]);
         BMU_Package[i].OVERTEMP_CRITICAL = mergeHLbyte(receivedframe->data[2], receivedframe->data[3]);
@@ -308,8 +336,8 @@ void processReceived_BMUmsg(twai_message_t *receivedframe, BMUdata *BMU_Package)
         break;
     }
   }
-
 }
+
 void processReceived_OBCmsg(twai_message_t *receivedframe) {
   if (receivedframe->identifier != 0x18FF50E5) return;
 
@@ -318,45 +346,82 @@ void processReceived_OBCmsg(twai_message_t *receivedframe) {
   OBC_Package.OBCAmp = mergeHLbyte(receivedframe->data[2], receivedframe->data[3]);
 }
 
-/************************* AMS Helper Functions ***************************/
-bool isModuleActive(int moduleIndex) {
-  return (millis() - lastModuleResponse[moduleIndex]) <= DISCONNENCTION_TIMEOUT;
+/************************* AMS Aggregation ***************************/
+
+/**
+ * Aggregate data from all active BMU modules into AMS_Package
+ * Called periodically (every 500ms) instead of per-message
+ */
+void aggregateAMSdata() {
+  // Reset AMS package for fresh aggregation
+  AMS_Package = AMSdata();
+
+  for (int j = 0; j < BMU_NUM; j++) {
+    // Calculate V_MODULE (sum of all cell voltages)
+    BMU_Package[j].V_MODULE = 0;
+    for (int k = 0; k < CELL_NUM; k++) {
+      BMU_Package[j].V_MODULE += BMU_Package[j].V_CELL[k];
+    }
+
+    // Update connection status and aggregate to AMS
+    if (isModuleActive(j)) {
+      BMU_Package[j].BMUconnected = true;
+      packing_AMSstruct(j);
+    } else {
+      BMU_Package[j].BMUconnected = false;
+    }
+  }
 }
-void resetModuleData(int moduleIndex) {
-  BMU_Package[moduleIndex] = BMUdata();
-}
+
+/**
+ * Pack a single BMU module's data into the AMS aggregate
+ * NOTE: V_MODULE should already be calculated before calling this
+ */
 void packing_AMSstruct(int moduleIndex) {
-  int &i = moduleIndex;
-  AMS_Package.ACCUM_VOLTAGE += static_cast<float>(BMU_Package[i].V_MODULE) * 0.2;
-  AMS_Package.OVERTEMP_WARNING |= BMU_Package[i].OVERTEMP_WARNING;
-  AMS_Package.OVERTEMP_CRITICAL |= BMU_Package[i].OVERTEMP_CRITICAL;
-  AMS_Package.OVERDIV_WARNING |= BMU_Package[i].OVERDIV_VOLTAGE_WARNING;
-  AMS_Package.OVERDIV_CRITICAL |= BMU_Package[i].OVERDIV_VOLTAGE_CRITICAL;
-  AMS_Package.ACCUM_CHG_READY &= BMU_Package[i].BMUreadytoCharge;
+  int k = moduleIndex;
+
+  // Accumulate voltage (scale factor 0.2 = 0.02V per bit * 10 cells)
+  AMS_Package.ACCUM_VOLTAGE += (float)(BMU_Package[k].V_MODULE) * 0.2;
+
+  // OR together all fault flags
+  AMS_Package.OVERTEMP_WARNING |= BMU_Package[k].OVERTEMP_WARNING;
+  AMS_Package.OVERTEMP_CRITICAL |= BMU_Package[k].OVERTEMP_CRITICAL;
+  AMS_Package.OVERDIV_WARNING |= BMU_Package[k].OVERDIV_VOLTAGE_WARNING;
+  AMS_Package.OVERDIV_CRITICAL |= BMU_Package[k].OVERDIV_VOLTAGE_CRITICAL;
+
+  // AND together charge ready (all must be ready)
+  AMS_Package.ACCUM_CHG_READY &= BMU_Package[k].BMUreadytoCharge;
 }
+
+/************************* Utility Functions ***************************/
+
 void resetAllStruct() {
   for (int i = 0; i < BMU_NUM; i++) {
-    resetModuleData(i);
+    BMU_Package[i] = BMUdata();
     lastModuleResponse[i] = 0;
   }
   AMS_Package = AMSdata();
   OBC_Package = OBCdata();
 }
+
+bool isModuleActive(int moduleIndex) {
+  // Module is active if we received a message within timeout period
+  // Note: lastModuleResponse[i] = 0 at startup means module is inactive
+  // until it actually responds (millis() - 0 will quickly exceed timeout)
+  unsigned long lastResponse = lastModuleResponse[moduleIndex];
+  if (lastResponse == 0) return false;  // Never received a response
+  return (millis() - lastResponse) <= DISCONNENCTION_TIMEOUT;
+}
+
 bool checkModuleDisconnect(BMUdata *BMU_Package) {
   for (short i = 0; i < BMU_NUM; i++) {
     if (!BMU_Package[i].BMUconnected) return false;
   }
   return true;
 }
-void dynamicModulereset(BMUdata *BMU_Package) {
-  for (short i = 0; i < BMU_NUM; i++) {
-    if (!BMU_Package[i].BMUconnected) {
-      resetModuleData(i);
-    }
-  }
-}
 
 /************************* Debug Functions ***************************/
+
 void debugAMSstate() {
   Serial.printf("AMS_OK: %d\n", AMS_OK);
   Serial.printf("AMS_VOLT: %.2f\n", AMS_Package.ACCUM_VOLTAGE);
@@ -372,22 +437,25 @@ void debugAMSstate() {
   Serial.printf("OV_DIV_WARN: %d\n", ACCUM_OverDivWarn);
 }
 
-
 void debugBMUMod(int moduleNum) {
   Serial.printf("BMU ID: %X\n", BMU_Package[moduleNum].BMU_ID);
   Serial.printf("BMU V_MODULE: %.2f\n", BMU_Package[moduleNum].V_MODULE);
-    Serial.print("BMU_VCELL[10]: ");
+
+  Serial.print("BMU_VCELL[10]: ");
   for (short i = 0; i < CELL_NUM; i++) {
     Serial.print(BMU_Package[moduleNum].V_CELL[i] * 0.02);
     Serial.print("V.  ");
-  } Serial.println();
+  }
+  Serial.println();
 
-  Serial.printf("BMU DV: %.2f\n", BMU_Package[moduleNum].DV *0.2);
+  Serial.printf("BMU DV: %.2f\n", BMU_Package[moduleNum].DV * 0.2);
+
   Serial.print("TEMP[2]: ");
   Serial.print(BMU_Package[moduleNum].TEMP_SENSE[0] * 0.6 + 2);
   Serial.print("C.  ");
   Serial.print(BMU_Package[moduleNum].TEMP_SENSE[1] * 0.6 + 2);
   Serial.println("C.  ");
+
   Serial.printf("BMU chargeMode: %d\n", BMU_Package[moduleNum].BMUreadytoCharge);
   Serial.printf("BMU connect: %d\n", BMU_Package[moduleNum].BMUconnected);
 

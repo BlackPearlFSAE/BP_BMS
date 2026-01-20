@@ -13,6 +13,8 @@ bool CAN32_initCANBus(int can_tx,int can_rx,
   // Configure CAN timing for 250 kbps (as per your code)
   twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)can_tx,(gpio_num_t)can_rx,TWAI_MODE_NORMAL);
   twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  g_config.rx_queue_len = 32;
+  g_config.tx_queue_len = 6;
   // Install TWAI driver
   if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
     Serial.println(" Driver installed");
@@ -39,6 +41,8 @@ bool CAN32_initCANBus(int can_tx,int can_rx,
   
   // Configure CAN timing for 250 kbps (as per your code)
   twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)can_tx,(gpio_num_t)can_rx,TWAI_MODE_NORMAL);
+  g_config.rx_queue_len = 32;
+  g_config.tx_queue_len = 32;
   // Install TWAI driver
   if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
     Serial.println(" Driver installed");
