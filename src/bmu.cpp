@@ -27,8 +27,8 @@
 #define CAN_TX_PIN       20
 #define CAN_RX_PIN       21
 #define CS_PIN           7
-#define TEMP_SENSOR1_PIN A0
-#define TEMP_SENSOR2_PIN A1
+#define TEMP_SENSOR1_PIN 0
+#define TEMP_SENSOR2_PIN 1
 
 /************************* Hardware Configuration ***************************/
 #define TOTAL_IC    1
@@ -46,20 +46,8 @@ bool canbusready = false;
 cell_asic bms_ic[TOTAL_IC];
 float cellvoltages[NUM_CELLS];
 
-// BMU MSG 1 data
-bool BMU_ReadyToCharge = false;              // Byte 0: Module ready to charge
-uint16_t BalancingDischarge_Cells = 0x0000;  // Byte 1-2: 10-bit cell balancing status
-uint8_t DV_raw = 0;                          // Byte 3: Delta V (factor 0.1V)
-
-// BMU MSG 4 & 5 Fault flags (10-bit per fault type, each bit = 1 cell)
-uint16_t OVERVOLTAGE_WARNING = 0x0000;
-uint16_t OVERVOLTAGE_CRITICAL = 0x0000;
-uint16_t LOWVOLTAGE_WARNING = 0x0000;
-uint16_t LOWVOLTAGE_CRITICAL = 0x0000;
-uint16_t OVERTEMP_WARNING = 0x0000;
-uint16_t OVERTEMP_CRITICAL = 0x0000;
-uint16_t OVERDIV_WARNING = 0x0000;
-uint16_t OVERDIV_CRITICAL = 0x0000;
+// BMU data struct (matches BCU's expected format from ams_common_conf.h)
+BMUdata myBMU;
 
 // BMU parameters (configurable from BCU at runtime)
 int transimission_time = BMS_COMMUNICATE_TIME;
@@ -91,7 +79,7 @@ unsigned long prevFaultMillis = 0;
 unsigned long lastCANHealthCheck = 0;
 unsigned long intervalMillis = 1000;        // Cell data transmission interval
 unsigned long faultIntervalMillis = 1300;   // Fault code transmission interval
-unsigned long canHealthCheckInterval = 5000; // CAN health check interval
+unsigned long canHealthCheckInterval = 10000; // CAN health check interval
 
 /************************* Function Declarations ***************************/
 
@@ -105,7 +93,7 @@ void checkCANHealth();
 void processBCUConfigMsg(twai_message_t* msg);
 
 // Message packing
-void packBMU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id, uint8_t temp1, uint8_t temp2);
+void packBMU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id);
 void packBMU_MSG2_CellsLowSeries(twai_message_t* msg, uint32_t id);
 void packBMU_MSG3_CellsHighSeries(twai_message_t* msg, uint32_t id);
 void packBMU_MSG4_FaultCode1(twai_message_t* msg, uint32_t id);
@@ -124,6 +112,7 @@ bool* balanceCells(float vmaxCell, float vminCell, float tempMaxCell, float dvMa
 void debugConfig();
 
 /************************* Setup ***************************/
+
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) { }
@@ -153,19 +142,20 @@ void setup() {
 }
 
 /************************* Main Loop ***************************/
+
 void loop() {
   uint32_t SESSION_TIME = millis();
   int ModuleNum = 5;  // TODO: Set from EEPROM or DIP switch
 
   /*==================== Sensor Reading ====================*/
 
-  // Read temperatures
+  // Read temperatures and populate myBMU.TEMP_SENSE
   currentTemp1 = getTemp(TEMP_SENSOR1_PIN, 0);
   currentTemp2 = getTemp(TEMP_SENSOR2_PIN, 0);
-  uint8_t temp1_encoded = encode_temp(currentTemp1);
-  uint8_t temp2_encoded = encode_temp(currentTemp2);
+  myBMU.TEMP_SENSE[0] = encode_temp(currentTemp1);
+  myBMU.TEMP_SENSE[1] = encode_temp(currentTemp2);
 
-  // Read cell voltages from LTC6811
+  // Read cell voltages from LTC6811 (also populates myBMU.V_CELL and V_MODULE)
   readAllCells();
 
   /*==================== CAN RX ====================*/
@@ -179,16 +169,16 @@ void loop() {
 
   /*==================== Data Processing ====================*/
 
-  // Calculate delta voltage and update DV_raw for CAN message
+  // Calculate delta voltage and update myBMU.DV for CAN message
   float dv = calculateDV();
-  DV_raw = (uint8_t)(dv / 0.1f);  // Factor 0.1V per spec
-  if (DV_raw > 10) DV_raw = 10;   // Clamp to 0-1V range
+  myBMU.DV = (uint8_t)(dv / 0.1f);  // Factor 0.1V per spec
+  if (myBMU.DV > 10) myBMU.DV = 10; // Clamp to 0-1V range
 
   // Update fault flags based on current readings
   updateFaultFlags();
 
   // Cell balancing when charging (pass config parameters)
-  if (BMU_ReadyToCharge) {
+  if (myBMU.BMUreadytoCharge) {
     bool* balancing = balanceCells(VmaxCell, VminCell, TempMaxCell, dVmax);
   }
 
@@ -197,7 +187,7 @@ void loop() {
   if (SESSION_TIME - prevMillis >= intervalMillis) {
     // BMU MSG 1: Operation Status (Priority=2, Msg=1)
     uint32_t bmu_id_msg1 = createExtendedCANID(2, ModuleNum, 1);
-    packBMU_MSG1_OperationStatus(&tx_message, bmu_id_msg1, temp1_encoded, temp2_encoded);
+    packBMU_MSG1_OperationStatus(&tx_message, bmu_id_msg1);
     if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
       Serial.println("CAN TX failed: MSG1 Operation Status");
     }
@@ -253,9 +243,13 @@ void readAllCells() {
   delay(10);
   int8_t error = LTC6811_rdcv(CELL_CH_ALL, TOTAL_IC, bms_ic);
 
+  uint16_t moduleSum = 0;
   for (int i = 0; i < NUM_CELLS; i++) {
-    cellvoltages[i] = bms_ic[0].cells.c_codes[i] * 0.0001;
+    cellvoltages[i] = bms_ic[0].cells.c_codes[i] * 0.0001f;
+    myBMU.V_CELL[i] = (uint8_t)(cellvoltages[i] / 0.02f);  // CAN format (0.02V factor)
+    moduleSum += myBMU.V_CELL[i];
   }
+  myBMU.V_MODULE = moduleSum;
 }
 
 float getTemp(int pin, int print) {
@@ -311,15 +305,15 @@ void checkCANHealth() {
 void processBCUConfigMsg(twai_message_t* msg) {
   if (msg->identifier != BCU_ADD) return;
 
-  bool BMUUpdateFlag = msg->data[6];
+  bool BMUUpdateFlag = msg->data[7];
   if (!BMUUpdateFlag) return;
 
-  transimission_time = msg->data[0];
-  BMU_ReadyToCharge = msg->data[1];
-  VmaxCell     = msg->data[2] * 0.1;
-  VminCell     = msg->data[3] * 0.1;
-  TempMaxCell  = msg->data[4];
-  dVmax        = msg->data[5] * 0.1;
+  transimission_time = mergeHLbyte(msg->data[0], msg->data[1]);
+  myBMU.BMUreadytoCharge = msg->data[2];
+  VmaxCell     = msg->data[3] * 0.1f;
+  VminCell     = msg->data[4] * 0.1f;
+  TempMaxCell  = msg->data[5];
+  dVmax        = msg->data[6] * 0.1f;
 
   updateThresholds();
 }
@@ -341,18 +335,18 @@ uint8_t encode_temp(float temp_c) {
 // Byte 4: Temp Sensor 1 (offset -40, factor 0.5C)
 // Byte 5: Temp Sensor 2 (offset -40, factor 0.5C)
 // Byte 6-7: Reserved
-void packBMU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id, uint8_t temp1, uint8_t temp2) {
+void packBMU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id) {
   msg->identifier = id;
   msg->extd = 1;
   msg->rtr = 0;
   msg->data_length_code = 8;
 
-  msg->data[0] = BMU_ReadyToCharge ? 1 : 0;
-  msg->data[1] = (BalancingDischarge_Cells >> 8) & 0xFF;
-  msg->data[2] = BalancingDischarge_Cells & 0xFF;
-  msg->data[3] = DV_raw;
-  msg->data[4] = temp1;
-  msg->data[5] = temp2;
+  msg->data[0] = myBMU.BMUreadytoCharge ? 1 : 0;
+  msg->data[1] = (myBMU.BalancingDischarge_Cells >> 8) & 0xFF;
+  msg->data[2] = myBMU.BalancingDischarge_Cells & 0xFF;
+  msg->data[3] = myBMU.DV;
+  msg->data[4] = myBMU.TEMP_SENSE[0];
+  msg->data[5] = myBMU.TEMP_SENSE[1];
   msg->data[6] = 0x00;
   msg->data[7] = 0x00;
 }
@@ -366,7 +360,7 @@ void packBMU_MSG2_CellsLowSeries(twai_message_t* msg, uint32_t id) {
   msg->data_length_code = 8;
 
   for (int i = 0; i < 8; i++) {
-    msg->data[i] = (uint8_t)(cellvoltages[i] / 0.02);
+    msg->data[i] = myBMU.V_CELL[i];
   }
 }
 
@@ -379,8 +373,8 @@ void packBMU_MSG3_CellsHighSeries(twai_message_t* msg, uint32_t id) {
   msg->rtr = 0;
   msg->data_length_code = 8;
 
-  msg->data[0] = (uint8_t)(cellvoltages[8] / 0.02);
-  msg->data[1] = (uint8_t)(cellvoltages[9] / 0.02);
+  msg->data[0] = myBMU.V_CELL[8];
+  msg->data[1] = myBMU.V_CELL[9];
   msg->data[2] = 0x00;
   msg->data[3] = 0x00;
   msg->data[4] = 0x00;
@@ -400,14 +394,14 @@ void packBMU_MSG4_FaultCode1(twai_message_t* msg, uint32_t id) {
   msg->rtr = 0;
   msg->data_length_code = 8;
 
-  msg->data[0] = (OVERVOLTAGE_WARNING >> 8) & 0xFF;
-  msg->data[1] = OVERVOLTAGE_WARNING & 0xFF;
-  msg->data[2] = (OVERVOLTAGE_CRITICAL >> 8) & 0xFF;
-  msg->data[3] = OVERVOLTAGE_CRITICAL & 0xFF;
-  msg->data[4] = (LOWVOLTAGE_WARNING >> 8) & 0xFF;
-  msg->data[5] = LOWVOLTAGE_WARNING & 0xFF;
-  msg->data[6] = (LOWVOLTAGE_CRITICAL >> 8) & 0xFF;
-  msg->data[7] = LOWVOLTAGE_CRITICAL & 0xFF;
+  msg->data[0] = (myBMU.OVERVOLTAGE_WARNING >> 8) & 0xFF;
+  msg->data[1] = myBMU.OVERVOLTAGE_WARNING & 0xFF;
+  msg->data[2] = (myBMU.OVERVOLTAGE_CRITICAL >> 8) & 0xFF;
+  msg->data[3] = myBMU.OVERVOLTAGE_CRITICAL & 0xFF;
+  msg->data[4] = (myBMU.LOWVOLTAGE_WARNING >> 8) & 0xFF;
+  msg->data[5] = myBMU.LOWVOLTAGE_WARNING & 0xFF;
+  msg->data[6] = (myBMU.LOWVOLTAGE_CRITICAL >> 8) & 0xFF;
+  msg->data[7] = myBMU.LOWVOLTAGE_CRITICAL & 0xFF;
 }
 
 // BMU MSG 5: Module Fault Code 2
@@ -421,14 +415,14 @@ void packBMU_MSG5_FaultCode2(twai_message_t* msg, uint32_t id) {
   msg->rtr = 0;
   msg->data_length_code = 8;
 
-  msg->data[0] = (OVERTEMP_WARNING >> 8) & 0xFF;
-  msg->data[1] = OVERTEMP_WARNING & 0xFF;
-  msg->data[2] = (OVERTEMP_CRITICAL >> 8) & 0xFF;
-  msg->data[3] = OVERTEMP_CRITICAL & 0xFF;
-  msg->data[4] = (OVERDIV_WARNING >> 8) & 0xFF;
-  msg->data[5] = OVERDIV_WARNING & 0xFF;
-  msg->data[6] = (OVERDIV_CRITICAL >> 8) & 0xFF;
-  msg->data[7] = OVERDIV_CRITICAL & 0xFF;
+  msg->data[0] = (myBMU.OVERTEMP_WARNING >> 8) & 0xFF;
+  msg->data[1] = myBMU.OVERTEMP_WARNING & 0xFF;
+  msg->data[2] = (myBMU.OVERTEMP_CRITICAL >> 8) & 0xFF;
+  msg->data[3] = myBMU.OVERTEMP_CRITICAL & 0xFF;
+  msg->data[4] = (myBMU.OVERDIV_VOLTAGE_WARNING >> 8) & 0xFF;
+  msg->data[5] = myBMU.OVERDIV_VOLTAGE_WARNING & 0xFF;
+  msg->data[6] = (myBMU.OVERDIV_VOLTAGE_CRITICAL >> 8) & 0xFF;
+  msg->data[7] = myBMU.OVERDIV_VOLTAGE_CRITICAL & 0xFF;
 }
 
 /************************* Fault Detection & Thresholds ***************************/
@@ -473,14 +467,14 @@ float calculateDV() {
 
 void updateFaultFlags() {
   // Reset all fault flags
-  OVERVOLTAGE_WARNING = 0;
-  OVERVOLTAGE_CRITICAL = 0;
-  LOWVOLTAGE_WARNING = 0;
-  LOWVOLTAGE_CRITICAL = 0;
-  OVERTEMP_WARNING = 0;
-  OVERTEMP_CRITICAL = 0;
-  OVERDIV_WARNING = 0;
-  OVERDIV_CRITICAL = 0;
+  myBMU.OVERVOLTAGE_WARNING = 0;
+  myBMU.OVERVOLTAGE_CRITICAL = 0;
+  myBMU.LOWVOLTAGE_WARNING = 0;
+  myBMU.LOWVOLTAGE_CRITICAL = 0;
+  myBMU.OVERTEMP_WARNING = 0;
+  myBMU.OVERTEMP_CRITICAL = 0;
+  myBMU.OVERDIV_VOLTAGE_WARNING = 0;
+  myBMU.OVERDIV_VOLTAGE_CRITICAL = 0;
 
   float avgV = calculateAvgVoltage();
 
@@ -490,24 +484,24 @@ void updateFaultFlags() {
 
     // Over voltage check
     if (cellvoltages[i] >= OV_CRITICAL_THRESHOLD) {
-      OVERVOLTAGE_CRITICAL |= cellBit;
+      myBMU.OVERVOLTAGE_CRITICAL |= cellBit;
     } else if (cellvoltages[i] > OV_WARNING_THRESHOLD) {
-      OVERVOLTAGE_WARNING |= cellBit;
+      myBMU.OVERVOLTAGE_WARNING |= cellBit;
     }
 
     // Low voltage check
     if (cellvoltages[i] <= LV_CRITICAL_THRESHOLD) {
-      LOWVOLTAGE_CRITICAL |= cellBit;
+      myBMU.LOWVOLTAGE_CRITICAL |= cellBit;
     } else if (cellvoltages[i] < LV_WARNING_THRESHOLD) {
-      LOWVOLTAGE_WARNING |= cellBit;
+      myBMU.LOWVOLTAGE_WARNING |= cellBit;
     }
 
     // Delta voltage check (per-cell deviation from average)
     float cellDV = fabs(cellvoltages[i] - avgV);
     if (cellDV >= DV_CRITICAL_THRESHOLD) {
-      OVERDIV_CRITICAL |= cellBit;
+      myBMU.OVERDIV_VOLTAGE_CRITICAL |= cellBit;
     } else if (cellDV >= DV_WARNING_THRESHOLD) {
-      OVERDIV_WARNING |= cellBit;
+      myBMU.OVERDIV_VOLTAGE_WARNING |= cellBit;
     }
   }
 
@@ -515,9 +509,9 @@ void updateFaultFlags() {
   float maxTemp = (currentTemp1 > currentTemp2) ? currentTemp1 : currentTemp2;
 
   if (maxTemp >= TEMP_CRITICAL_THRESHOLD) {
-    OVERTEMP_CRITICAL = 0x3FF;
+    myBMU.OVERTEMP_CRITICAL = 0x3FF;
   } else if (maxTemp >= TEMP_WARNING_THRESHOLD) {
-    OVERTEMP_WARNING = 0x3FF;
+    myBMU.OVERTEMP_WARNING = 0x3FF;
   }
 }
 
@@ -536,13 +530,13 @@ bool* balanceCells(float vmaxCell, float vminCell, float tempMaxCell, float dvMa
     balancingStatus[i] = false;
   }
 
-  if (!BMU_ReadyToCharge) {
+  if (!myBMU.BMUreadytoCharge) {
     // Clear LTC6811 discharge when not charging
     bms_ic[0].config.tx_data[4] = 0;
     bms_ic[0].config.tx_data[5] &= 0xFC;
     LTC6811_wrcfg(TOTAL_IC, bms_ic);
 
-    BalancingDischarge_Cells = toUint16FromBitarrayMSB(balancingStatus);
+    myBMU.BalancingDischarge_Cells = toUint16FromBitarrayMSB(balancingStatus);
     return balancingStatus;
   }
 
@@ -564,7 +558,7 @@ bool* balanceCells(float vmaxCell, float vminCell, float tempMaxCell, float dvMa
   }
 
   // Convert boolean array to uint16_t for CAN message (MSB-first format)
-  BalancingDischarge_Cells = toUint16FromBitarrayMSB(balancingStatus);
+  myBMU.BalancingDischarge_Cells = toUint16FromBitarrayMSB(balancingStatus);
 
   // Configure LTC6811 discharge (DCC bits are LSB-first: bit 0 = Cell 1)
   uint16_t dischargeBits = toUint16FromBitarrayLSB(balancingStatus);
@@ -575,7 +569,7 @@ bool* balanceCells(float vmaxCell, float vminCell, float tempMaxCell, float dvMa
 
   if (dischargeBits != 0) {
     Serial.printf("Balancing: 0x%03X (avg=%.3fV, CAN=0x%03X)\n",
-                  dischargeBits, avgV, BalancingDischarge_Cells);
+                  dischargeBits, avgV, myBMU.BalancingDischarge_Cells);
   }
 
   return balancingStatus;
@@ -586,7 +580,7 @@ bool* balanceCells(float vmaxCell, float vminCell, float tempMaxCell, float dvMa
 void debugConfig() {
   Serial.println("=== BMU Runtime Config ===");
   Serial.printf("SyncTime: %dms\n", transimission_time);
-  Serial.printf("ChargerPlugged: %s\n", BMU_ReadyToCharge ? "YES" : "NO");
+  Serial.printf("ReadyToCharge: %s\n", myBMU.BMUreadytoCharge ? "YES" : "NO");
   Serial.printf("VmaxCell: %.1fV\n", VmaxCell);
   Serial.printf("VminCell: %.1fV\n", VminCell);
   Serial.printf("TempMax: %.0fC\n", TempMaxCell);

@@ -5,9 +5,9 @@
 
 // Cell Configuration 
 #define CELL_NUM 10
-// #define BMU_NUM 4
-#define BMU_NUM 2 // Test config
-// #define BMU_NUM 0 // Headless config
+#define MODULE_NUM 8
+// #define MODULE_NUM 2 // Test config
+// #define MODULE_NUM 0 // Headless config
 
 /*LG34 Battery*/
 #define VMAX_CELL 4.2
@@ -55,8 +55,8 @@ struct BMUdata {
 struct AMSdata {
 
   float ACCUM_VOLTAGE = 0.0; 
-  float ACCUM_MAXVOLTAGE = (VMAX_CELL * CELL_NUM * BMU_NUM); // Default value
-  float ACCUM_MINVOLTAGE = (VMIN_CELL * CELL_NUM * BMU_NUM); // Defualt value assum 8 module
+  float ACCUM_MAXVOLTAGE = (VMAX_CELL * CELL_NUM * MODULE_NUM); // Default value
+  float ACCUM_MINVOLTAGE = (VMIN_CELL * CELL_NUM * MODULE_NUM); // Defualt value assum 8 module
   // float ACCUM_MAXVOLTAGE = (0); // For headless test
   // float ACCUM_MINVOLTAGE = (0); // For headless test
   bool ACCUM_CHG_READY = 0;
