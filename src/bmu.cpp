@@ -142,10 +142,10 @@ void setup() {
 }
 
 /************************* Main Loop ***************************/
-
+unsigned long debug_timer = 0;
+int ModuleNumber = 8;
 void loop() {
   uint32_t SESSION_TIME = millis();
-  int ModuleNum = 5;  // TODO: Set from EEPROM or DIP switch
 
   /*==================== Sensor Reading ====================*/
 
@@ -157,6 +157,13 @@ void loop() {
 
   // Read cell voltages from LTC6811 (also populates myBMU.V_CELL and V_MODULE)
   readAllCells();
+  if(SESSION_TIME - debug_timer >= 200){
+    Serial.print("Vcell[10]: ");
+    for(int i = 0 ; i < CELL_NUM ; i ++)
+      Serial.printf("%.2f, ",myBMU.V_CELL[i] * 0.02);
+    Serial.println();
+    debug_timer = millis();
+  }
 
   /*==================== CAN RX ====================*/
 
@@ -186,21 +193,21 @@ void loop() {
 
   if (SESSION_TIME - prevMillis >= intervalMillis) {
     // BMU MSG 1: Operation Status (Priority=2, Msg=1)
-    uint32_t bmu_id_msg1 = createExtendedCANID(2, ModuleNum, 1);
+    uint32_t bmu_id_msg1 = createExtendedCANID(2, ModuleNumber, 1);
     packBMU_MSG1_OperationStatus(&tx_message, bmu_id_msg1);
     if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
       Serial.println("CAN TX failed: MSG1 Operation Status");
     }
 
     // BMU MSG 2: Cell 1-8 (Priority=2, Msg=2)
-    uint32_t bmu_id_msg2 = createExtendedCANID(2, ModuleNum, 2);
+    uint32_t bmu_id_msg2 = createExtendedCANID(2, ModuleNumber, 2);
     packBMU_MSG2_CellsLowSeries(&tx_message, bmu_id_msg2);
     if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
       Serial.println("CAN TX failed: MSG2 Cells 1-8");
     }
 
     // BMU MSG 3: Cell 9-10 (Priority=2, Msg=3)
-    uint32_t bmu_id_msg3 = createExtendedCANID(2, ModuleNum, 3);
+    uint32_t bmu_id_msg3 = createExtendedCANID(2, ModuleNumber, 3);
     packBMU_MSG3_CellsHighSeries(&tx_message, bmu_id_msg3);
     if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
       Serial.println("CAN TX failed: MSG3 Cells 9-10");
@@ -212,14 +219,14 @@ void loop() {
 
   if (SESSION_TIME - prevFaultMillis >= faultIntervalMillis) {
     // BMU MSG 4: Fault Code 1 - OV/LV (Priority=1, Msg=1)
-    uint32_t bmu_id_fault1 = createExtendedCANID(1, ModuleNum, 1);
+    uint32_t bmu_id_fault1 = createExtendedCANID(1, ModuleNumber, 1);
     packBMU_MSG4_FaultCode1(&tx_message, bmu_id_fault1);
     if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
       Serial.println("CAN TX failed: MSG4 Fault Code 1");
     }
 
     // BMU MSG 5: Fault Code 2 - Temp/DV (Priority=1, Msg=2)
-    uint32_t bmu_id_fault2 = createExtendedCANID(1, ModuleNum, 2);
+    uint32_t bmu_id_fault2 = createExtendedCANID(1, ModuleNumber, 2);
     packBMU_MSG5_FaultCode2(&tx_message, bmu_id_fault2);
     if (CAN32_sendCAN(&tx_message, canbusready) != ESP_OK) {
       Serial.println("CAN TX failed: MSG5 Fault Code 2");
