@@ -15,12 +15,12 @@
 #include "freertos/semphr.h"
 
 // Helper function
-#include <BP_mobile_util.h>
-#include <SD32_util.h>
-#include <WIFI32_util.h>
-#include <syncTime_util.h>
-#include <RTClib_helper.h>
-#include <ams_config.h>
+#include "BP_mobile_util.h"
+#include "SD32_util.h"
+#include "WIFI32_util.h"
+#include "syncTime_util.h"
+#include "RTClib_helper.h"
+#include "ams_common_conf.h"
 
 // ============================================================================
 // BP MOBILE SERVER CONFIGURATION
@@ -80,7 +80,7 @@ const unsigned long SD_CLOSE_INTERVAL = 10000;
 
 // Session directory and file paths
 char sessionDirPath[32] = {0};
-char bmuFilePaths[BMU_NUM][48] = {0};
+char bmuFilePaths[MODULE_NUM][48] = {0};
 char amsFilePath[48] = {0};
 
 // CSV Headers
@@ -93,7 +93,7 @@ const char* header_AMS = "DataPoint,UnixTime,SessionTime,ACCUM_VOLTAGE,ACCUM_MAX
                          "AMS_OK,CHG_READY,OV_WARN,OV_CRIT,LV_WARN,LV_CRIT,OT_WARN,OT_CRIT,ODV_WARN,ODV_CRIT";
 
 // ---- Global Data
-BMUdata BMU_Package[BMU_NUM];
+BMUdata BMU_Package[MODULE_NUM];
 AMSdata AMS_Package;
 
 // ============================================================================
@@ -123,12 +123,12 @@ struct SDLogEntry {
   int dataPoint;
   uint64_t unixTime;
   uint64_t sessionTime;
-  BMUdata bmu[BMU_NUM];
+  BMUdata bmu[MODULE_NUM];
   AMSdata ams;
 };
 
 // File handles for persistent logging (one per BMU + one for AMS)
-static File bmuFiles[BMU_NUM];
+static File bmuFiles[MODULE_NUM];
 static File amsFile;
 static bool filesOpen = false;
 
@@ -149,7 +149,7 @@ void BPMobileTask(void* parameter) {
   unsigned long taskLastAMS = 0;
 
   // Local copies of sensor data
-  BMUdata localBMU[BMU_NUM];
+  BMUdata localBMU[MODULE_NUM];
   AMSdata localAMS;
 
   while (true) {
@@ -175,7 +175,7 @@ void BPMobileTask(void* parameter) {
 
       // Publish BMU cell voltages
       if (now - taskLastBMUcells >= (unsigned long)(1000.0 / BMU_CELLS_SAMPLING_RATE)) {
-        for (int i = 0; i < BMU_NUM; i++) {
+        for (int i = 0; i < MODULE_NUM; i++) {
           publishBMUcells(&localBMU[i], i);
         }
         taskLastBMUcells = now;
@@ -183,7 +183,7 @@ void BPMobileTask(void* parameter) {
 
       // Publish BMU faults
       if (now - taskLastBMUfaults >= (unsigned long)(1000.0 / BMU_FAULT_SAMPLING_RATE)) {
-        for (int i = 0; i < BMU_NUM; i++) {
+        for (int i = 0; i < MODULE_NUM; i++) {
           publishBMUfaults(&localBMU[i], i);
         }
         taskLastBMUfaults = now;
@@ -220,7 +220,7 @@ void sdTask(void* parameter) {
 
       unsigned long now = millis();
       // Write to all BMU files (every entry = 200ms)
-      for (int i = 0; i < BMU_NUM; i++) {
+      for (int i = 0; i < MODULE_NUM; i++) {
         if (bmuFiles[i]) {
           append_BMU_toCSVFile(bmuFiles[i], &entry.bmu[i], entry.dataPoint, entry.unixTime, entry.sessionTime);
         }
@@ -291,7 +291,7 @@ void setup() {
     SD32_createSessionDir(sessionNumber, sessionDirPath);
 
     // Generate file paths for each BMU
-    for (int i = 0; i < BMU_NUM; i++) {
+    for (int i = 0; i < MODULE_NUM; i++) {
       SD32_generateFilenameInDir(bmuFilePaths[i], sessionDirPath, "bmu", i);
       Serial.printf("  BMU %d file: %s\n", i, bmuFilePaths[i]);
     }
@@ -301,7 +301,7 @@ void setup() {
     Serial.printf("  AMS file: %s\n", amsFilePath);
 
     // Create CSV files with headers
-    for (int i = 0; i < BMU_NUM; i++) {
+    for (int i = 0; i < MODULE_NUM; i++) {
       SD32_createCSVFile(bmuFilePaths[i], header_BMU);
     }
     SD32_createCSVFile(amsFilePath, header_AMS);
@@ -359,7 +359,7 @@ void setup() {
 
   Serial.println("==================================================");
   Serial.println("       BMS Data Logger - Ready");
-  Serial.printf("       Session: %d | BMU Count: %d\n", sessionNumber, BMU_NUM);
+  Serial.printf("       Session: %d | BMU Count: %d\n", sessionNumber, MODULE_NUM);
   Serial.printf("       Client: %s\n", clientName);
   Serial.println("==================================================");
 }
@@ -402,17 +402,23 @@ void loop() {
 
   // Mock data for testing (remove in production)
   #ifdef MOCK_DATA
-  for (int i = 0; i < BMU_NUM; i++) {
-    BMU_Package[i].bmu_id = i;
-    BMU_Package[i].V_MODULE = 36 + (rand() % 5);
-    BMU_Package[i].TEMP_SENSE[0] = 25 + (rand() % 10);
-    BMU_Package[i].TEMP_SENSE[1] = 25 + (rand() % 10);
+  for (int i = 0; i < MODULE_NUM; i++) {
+    BMU_Package[i].BMU_ID = i;
+    // V_CELL: encoded as uint8_t with 0.02V factor (3.6V = 180, 4.1V = 205)
+    uint16_t moduleSum = 0;
     for (int j = 0; j < CELL_NUM; j++) {
-      BMU_Package[i].V_CELL[j] = 36 + (rand() % 5);  // 3.6-4.1V scaled
+      BMU_Package[i].V_CELL[j] = 180 + (rand() % 25);  // 3.6-4.1V range
+      moduleSum += BMU_Package[i].V_CELL[j];
     }
+    BMU_Package[i].V_MODULE = moduleSum;  // Sum of encoded cell values
+    // TEMP_SENSE: encoded as uint8_t with offset -40 and 0.5C factor (25C = 130)
+    BMU_Package[i].TEMP_SENSE[0] = 130 + (rand() % 20);  // 25-35C range
+    BMU_Package[i].TEMP_SENSE[1] = 130 + (rand() % 20);
+    BMU_Package[i].DV = rand() % 3;  // 0-0.2V DV (factor 0.1V)
     BMU_Package[i].BMUconnected = true;
   }
-  AMS_Package.ACCUM_VOLTAGE = 336.0 + (rand() % 20);
+  // AMS_Package: ACCUM_VOLTAGE is in actual volts (aggregated from BCU)
+  AMS_Package.ACCUM_VOLTAGE = 336.0f + (rand() % 20);
   AMS_Package.AMS_OK = true;
   #endif
 
@@ -455,7 +461,7 @@ void loop() {
 // FILE MANAGEMENT
 // ============================================================================
 void openAllFiles() {
-  for (int i = 0; i < BMU_NUM; i++) {
+  for (int i = 0; i < MODULE_NUM; i++) {
     bmuFiles[i] = SD.open(bmuFilePaths[i], FILE_APPEND);
     if (!bmuFiles[i]) {
       Serial.printf("[SD Card] ERROR: Could not open BMU file %d\n", i);
@@ -470,7 +476,7 @@ void openAllFiles() {
 }
 
 void closeAllFiles() {
-  for (int i = 0; i < BMU_NUM; i++) {
+  for (int i = 0; i < MODULE_NUM; i++) {
     if (bmuFiles[i]) {
       bmuFiles[i].flush();
       bmuFiles[i].close();
@@ -485,7 +491,7 @@ void closeAllFiles() {
 }
 
 void flushAllFiles() {
-  for (int i = 0; i < BMU_NUM; i++) {
+  for (int i = 0; i < MODULE_NUM; i++) {
     if (bmuFiles[i]) {
       bmuFiles[i].flush();
     }
@@ -504,30 +510,30 @@ void append_BMU_toCSVFile(File& dataFile, BMUdata* bmu, int dp, uint64_t Timesta
   dataFile.print(Timestamp); dataFile.print(",");
   dataFile.print(session); dataFile.print(",");
 
-  // V_MODULE, TEMP1, TEMP2, DV
-  dataFile.print(bmu->V_MODULE); dataFile.print(",");
-  dataFile.print(bmu->TEMP_SENSE[0]); dataFile.print(",");
-  dataFile.print(bmu->TEMP_SENSE[1]); dataFile.print(",");
-  dataFile.print(bmu->DV); dataFile.print(",");
+  // V_MODULE (scaled: 0.02V per bit), TEMP1, TEMP2 (decoded: (val * 0.5) - 40), DV (scaled: 0.1V per bit)
+  dataFile.print(bmu->V_MODULE * 0.02f, 2); dataFile.print(",");
+  dataFile.print((bmu->TEMP_SENSE[0] * 0.5f) - 40.0f, 1); dataFile.print(",");
+  dataFile.print((bmu->TEMP_SENSE[1] * 0.5f) - 40.0f, 1); dataFile.print(",");
+  dataFile.print(bmu->DV * 0.1f, 2); dataFile.print(",");
 
-  // Cell voltages (10 cells)
+  // Cell voltages (10 cells, scaled: 0.02V per bit)
   for (int i = 0; i < CELL_NUM; i++) {
-    dataFile.print(bmu->V_CELL[i]);
+    dataFile.print(bmu->V_CELL[i] * 0.02f, 3);
     dataFile.print(",");
   }
 
-  // Fault flags
-  dataFile.print(bmu->OVERVOLTAGE_WARNING); dataFile.print(",");
-  dataFile.print(bmu->OVERVOLTAGE_CRITICAL); dataFile.print(",");
-  dataFile.print(bmu->LOWVOLTAGE_WARNING); dataFile.print(",");
-  dataFile.print(bmu->LOWVOLTAGE_CRITICAL); dataFile.print(",");
-  dataFile.print(bmu->OVERTEMP_WARNING); dataFile.print(",");
-  dataFile.print(bmu->OVERTEMP_CRITICAL); dataFile.print(",");
-  dataFile.print(bmu->OVERDIV_VOLTAGE_WARNING); dataFile.print(",");
-  dataFile.print(bmu->OVERDIV_VOLTAGE_CRITICAL); dataFile.print(",");
+  // Fault flags (16-bit bitmasks, log as hex for readability)
+  dataFile.print(bmu->OVERVOLTAGE_WARNING, HEX); dataFile.print(",");
+  dataFile.print(bmu->OVERVOLTAGE_CRITICAL, HEX); dataFile.print(",");
+  dataFile.print(bmu->LOWVOLTAGE_WARNING, HEX); dataFile.print(",");
+  dataFile.print(bmu->LOWVOLTAGE_CRITICAL, HEX); dataFile.print(",");
+  dataFile.print(bmu->OVERTEMP_WARNING, HEX); dataFile.print(",");
+  dataFile.print(bmu->OVERTEMP_CRITICAL, HEX); dataFile.print(",");
+  dataFile.print(bmu->OVERDIV_VOLTAGE_WARNING, HEX); dataFile.print(",");
+  dataFile.print(bmu->OVERDIV_VOLTAGE_CRITICAL, HEX); dataFile.print(",");
 
-  // Status
-  dataFile.print(bmu->BalancingDischarge_Cells); dataFile.print(",");
+  // Status (balancing as hex bitmask)
+  dataFile.print(bmu->BalancingDischarge_Cells, HEX); dataFile.print(",");
   dataFile.print(bmu->BMUconnected); dataFile.print(",");
   dataFile.println(bmu->BMUreadytoCharge);
 }
@@ -538,24 +544,24 @@ void append_AMS_toCSVFile(File& dataFile, AMSdata* ams, int dp, uint64_t Timesta
   dataFile.print(Timestamp); dataFile.print(",");
   dataFile.print(session); dataFile.print(",");
 
-  // Accumulator data
+  // Accumulator data (ACCUM_VOLTAGE is already in volts from BCU aggregation)
   dataFile.print(ams->ACCUM_VOLTAGE, 2); dataFile.print(",");
   dataFile.print(ams->ACCUM_MAXVOLTAGE, 2); dataFile.print(",");
   dataFile.print(ams->ACCUM_MINVOLTAGE, 2); dataFile.print(",");
 
-  // Status flags
-  dataFile.print(ams->AMS_OK); dataFile.print(",");
-  dataFile.print(ams->ACCUM_CHG_READY); dataFile.print(",");
+  // Status flags (bool values: 0 or 1)
+  dataFile.print(ams->AMS_OK ? 1 : 0); dataFile.print(",");
+  dataFile.print(ams->ACCUM_CHG_READY ? 1 : 0); dataFile.print(",");
 
-  // Warning flags
-  dataFile.print(ams->OVERVOLT_WARNING); dataFile.print(",");
-  dataFile.print(ams->OVERVOLT_CRITICAL); dataFile.print(",");
-  dataFile.print(ams->LOWVOLT_WARNING); dataFile.print(",");
-  dataFile.print(ams->LOWVOLT_CRITICAL); dataFile.print(",");
-  dataFile.print(ams->OVERTEMP_WARNING); dataFile.print(",");
-  dataFile.print(ams->OVERTEMP_CRITICAL); dataFile.print(",");
-  dataFile.print(ams->OVERDIV_WARNING); dataFile.print(",");
-  dataFile.println(ams->OVERDIV_CRITICAL);
+  // Warning/Critical flags (bool values: 0 or 1)
+  dataFile.print(ams->OVERVOLT_WARNING ? 1 : 0); dataFile.print(",");
+  dataFile.print(ams->OVERVOLT_CRITICAL ? 1 : 0); dataFile.print(",");
+  dataFile.print(ams->LOWVOLT_WARNING ? 1 : 0); dataFile.print(",");
+  dataFile.print(ams->LOWVOLT_CRITICAL ? 1 : 0); dataFile.print(",");
+  dataFile.print(ams->OVERTEMP_WARNING ? 1 : 0); dataFile.print(",");
+  dataFile.print(ams->OVERTEMP_CRITICAL ? 1 : 0); dataFile.print(",");
+  dataFile.print(ams->OVERDIV_WARNING ? 1 : 0); dataFile.print(",");
+  dataFile.println(ams->OVERDIV_CRITICAL ? 1 : 0);
 }
 // ============================================================================
 // BPMOBILE PUBLISHING FUNCTIONS
@@ -569,7 +575,7 @@ void registerClient(const char* name) {
   JsonArray topics = doc["topics"].to<JsonArray>();
 
   // BMU cell topics (one per module)
-  for (int i = 0; i < BMU_NUM; i++) {
+  for (int i = 0; i < MODULE_NUM; i++) {
     char topic[32];
     snprintf(topic, sizeof(topic), "bms/bmu%d/cells", i);
     topics.add(topic);
@@ -581,7 +587,7 @@ void registerClient(const char* name) {
   // Define topic metadata
   JsonObject metadata = doc["topic_metadata"].to<JsonObject>();
 
-  for (int i = 0; i < BMU_NUM; i++) {
+  for (int i = 0; i < MODULE_NUM; i++) {
     char topic[32];
     snprintf(topic, sizeof(topic), "bms/bmu%d/cells", i);
     JsonObject cellMeta = metadata[topic].to<JsonObject>();
@@ -624,19 +630,19 @@ void publishBMUcells(BMUdata* bmu, int moduleNum) {
 
   JsonObject data = doc["data"].to<JsonObject>();
   data["module"] = moduleNum;
-  data["v_module"] = bmu->V_MODULE;
+  data["v_module"] = bmu->V_MODULE * 0.02f;  // Scaled to actual volts
 
   JsonArray cells = data["cells"].to<JsonArray>();
   for (int i = 0; i < CELL_NUM; i++) {
-    cells.add(bmu->V_CELL[i]);
+    cells.add(bmu->V_CELL[i] * 0.02f);  // Scaled to actual volts
   }
 
   JsonArray temps = data["temps"].to<JsonArray>();
   for (int i = 0; i < TEMP_SENSOR_NUM; i++) {
-    temps.add(bmu->TEMP_SENSE[i]);
+    temps.add((bmu->TEMP_SENSE[i] * 0.5f) - 40.0f);  // Decoded to Celsius
   }
 
-  data["dv"] = bmu->DV;
+  data["dv"] = bmu->DV * 0.1f;  // Scaled to actual volts
   data["connected"] = bmu->BMUconnected;
 
   doc["timestamp"] = timestamp;
