@@ -33,7 +33,7 @@ struct BMUdata {
   // Basic BMU Data
   uint32_t BMU_ID = 0x00; 
   uint8_t V_CELL[CELL_NUM] = {0};
-  uint8_t TEMP_SENSE[TEMP_SENSOR_NUM] = {0};
+  uint16_t TEMP_SENSE[TEMP_SENSOR_NUM] = {0};
   uint16_t V_MODULE = 0;
   uint8_t DV = 0;
   // FaultCode 10 bit binary representation of C

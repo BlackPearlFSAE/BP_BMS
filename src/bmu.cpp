@@ -28,7 +28,7 @@
 #define CAN_RX_PIN       21
 #define CS_PIN           7
 #define TEMP_SENSOR1_PIN 0
-#define TEMP_SENSOR2_PIN 1
+#define TEMP_SENSOR2_PIN 2
 
 /************************* Hardware Configuration ***************************/
 #define TOTAL_IC    1
@@ -143,17 +143,18 @@ void setup() {
 
 /************************* Main Loop ***************************/
 unsigned long debug_timer = 0;
-int ModuleNumber = 8;
+int ModuleNumber = 2;
 void loop() {
   uint32_t SESSION_TIME = millis();
 
   /*==================== Sensor Reading ====================*/
 
   // Read temperatures and populate myBMU.TEMP_SENSE
-  currentTemp1 = getTemp(TEMP_SENSOR1_PIN, 0);
-  currentTemp2 = getTemp(TEMP_SENSOR2_PIN, 0);
-  myBMU.TEMP_SENSE[0] = encode_temp(currentTemp1);
-  myBMU.TEMP_SENSE[1] = encode_temp(currentTemp2);
+  currentTemp1 = (uint16_t)(getTemp(TEMP_SENSOR1_PIN, 0));
+  currentTemp2 = (uint16_t)(getTemp(TEMP_SENSOR2_PIN, 0));
+  // Serial.printf("Temp1: %.2f C, Temp2: %.2f C\n", currentTemp1, currentTemp2);
+  myBMU.TEMP_SENSE[0] = currentTemp1;
+  myBMU.TEMP_SENSE[1] = currentTemp2;
 
   // Read cell voltages from LTC6811 (also populates myBMU.V_CELL and V_MODULE)
   readAllCells();
@@ -327,13 +328,13 @@ void processBCUConfigMsg(twai_message_t* msg) {
 
 /************************* CAN Message Packing ***************************/
 
-uint8_t encode_temp(float temp_c) {
-  if (temp_c < -40.0f) temp_c = -40.0f;
-  if (temp_c > 87.5f) temp_c = 87.5f;
+// uint8_t encode_temp(float temp_c) {
+//   if (temp_c < -40.0f) temp_c = -40.0f;
+//   if (temp_c > 87.5f) temp_c = 87.5f;
 
-  float scaled = (temp_c + 40.0f) * 2.0f;
-  return (uint8_t)(scaled + 0.5f);
-}
+//   float scaled = (temp_c + 40.0f) * 2.0f;
+//   return (uint8_t)(scaled + 0.5f);
+// }
 
 // BMU MSG 1: Module Operation & Voltage Status
 // Byte 0: BMU Enter Charging Mode (0=NO, 1=YES)
@@ -347,15 +348,16 @@ void packBMU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id) {
   msg->extd = 1;
   msg->rtr = 0;
   msg->data_length_code = 8;
-
   msg->data[0] = myBMU.BMUreadytoCharge ? 1 : 0;
   msg->data[1] = (myBMU.BalancingDischarge_Cells >> 8) & 0xFF;
   msg->data[2] = myBMU.BalancingDischarge_Cells & 0xFF;
   msg->data[3] = myBMU.DV;
-  msg->data[4] = myBMU.TEMP_SENSE[0];
-  msg->data[5] = myBMU.TEMP_SENSE[1];
-  msg->data[6] = 0x00;
-  msg->data[7] = 0x00;
+  uint16_t temp1_scaled = (uint16_t)(myBMU.TEMP_SENSE[0] * 10);
+  uint16_t temp2_scaled = (uint16_t)(myBMU.TEMP_SENSE[1] * 10);
+  msg->data[4] = (temp1_scaled >> 8) & 0xFF;  // Temp1 high byte
+  msg->data[5] = temp1_scaled & 0xFF;         // Temp1 low byte
+  msg->data[6] = (temp2_scaled >> 8) & 0xFF;  // Temp2 high byte
+  msg->data[7] = temp2_scaled & 0xFF;         // Temp2 low byte
 }
 
 // BMU MSG 2: Cell Monitoring LOW SERIES
