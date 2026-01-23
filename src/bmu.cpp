@@ -19,7 +19,7 @@
 #include "LTC681x.h"
 #include "Linduino.h"
 #include "CAN32_util.h"
-#include "ams_common_conf.h"
+#include "ams_config.h"
 #include "helper.h"
 #include "ntstermistor.h"
 
@@ -143,7 +143,7 @@ void setup() {
 
 /************************* Main Loop ***************************/
 unsigned long debug_timer = 0;
-int ModuleNumber = 2;
+int ModuleNumber = 7;
 void loop() {
   uint32_t SESSION_TIME = millis();
 
@@ -165,6 +165,8 @@ void loop() {
     Serial.println();
     debug_timer = millis();
   }
+
+
 
   /*==================== CAN RX ====================*/
 
@@ -313,11 +315,13 @@ void checkCANHealth() {
 void processBCUConfigMsg(twai_message_t* msg) {
   if (msg->identifier != BCU_ADD) return;
 
+  // Save Charge Mode flag
+  myBMU.BMUreadytoCharge = msg->data[2];
+  
+  // If Update flag is true, do it
   bool BMUUpdateFlag = msg->data[7];
   if (!BMUUpdateFlag) return;
-
   transimission_time = mergeHLbyte(msg->data[0], msg->data[1]);
-  myBMU.BMUreadytoCharge = msg->data[2];
   VmaxCell     = msg->data[3] * 0.1f;
   VminCell     = msg->data[4] * 0.1f;
   TempMaxCell  = msg->data[5];
