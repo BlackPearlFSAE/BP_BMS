@@ -22,7 +22,7 @@
 #include "LTC6811.h"
 #include "LTC681x.h"
 #include "Linduino.h"
-#include "ams_common_conf.h"
+#include "ams_config.h"
 #include "helper.h"
 #include "ntstermistor.h"
 
@@ -40,6 +40,7 @@
 /************************* LTC6811 Configuration ***************************/
 #define TOTAL_IC    1
 #define NUM_CELLS   CELL_NUM
+#define BALANCE_THRESHOLD 0.01f  // 10mV above average triggers balancing
 
 /************************* Global Variables ***************************/
 
@@ -87,6 +88,7 @@ bool OVER_TEMP_CRIT = false;
 bool LOW_VOLT_CRIT = false;
 bool LOW_VOLT_WARN = false;
 bool OVER_VOLT_CRIT = false;
+bool OVER_VOLT_WARN = false;
 bool ACCUM_FULL = false;
 bool ACCUM_LOW = false;
 
@@ -103,6 +105,15 @@ cell_asic bms_ic[TOTAL_IC];
 float cellvoltages[NUM_CELLS];
 float currentTemp1 = 25.0f;
 float currentTemp2 = 25.0f;
+
+// BCU local CAN TX timing
+unsigned long bcu_local_prevMillis = 0;
+unsigned long bcu_local_prevFaultMillis = 0;
+unsigned long bcu_local_intervalMillis = 1000;        // Cell data transmission interval
+unsigned long bcu_local_faultIntervalMillis = 1300;   // Fault code transmission interval
+
+// Balancing status array (index 0 = Cell 1)
+static bool balancingStatus[NUM_CELLS];
 
 // Fault thresholds (calculated from config)
 float OV_WARNING_THRESHOLD;
@@ -134,6 +145,14 @@ void updateLocalFaultFlags(BMUdata *localModule);
 float calculateLocalAvgVoltage();
 float calculateLocalDV();
 uint8_t encode_temp(float temp_c);
+bool* balanceLocalCells(float vmaxCell, float vminCell, float tempMaxCell, float dvMax);
+
+// BCU local CAN TX message packing (same format as BMU)
+void packBCU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id, BMUdata* localModule);
+void packBCU_MSG2_CellsLowSeries(twai_message_t* msg, uint32_t id, BMUdata* localModule);
+void packBCU_MSG3_CellsHighSeries(twai_message_t* msg, uint32_t id, BMUdata* localModule);
+void packBCU_MSG4_FaultCode1(twai_message_t* msg, uint32_t id, BMUdata* localModule);
+void packBCU_MSG5_FaultCode2(twai_message_t* msg, uint32_t id, BMUdata* localModule);
 
 // Debug functions (can be disabled in production)
 void debugAMSstate();
@@ -242,6 +261,48 @@ void loop() {
 
   updateLocalBMU(&BMU_Package[BCU_LOCAL_INDEX]);
 
+  // Cell balancing when charging (pass config parameters)
+  if (BMU_Package[BCU_LOCAL_INDEX].BMUreadytoCharge) {
+    balanceLocalCells(VmaxCell, VminCell, TempMaxCell, dVmax);
+  }
+
+  /*==================== BCU Local CAN TX: Cell Data (1000ms) ====================*/
+
+  if (SESSION_TIME - bcu_local_prevMillis >= bcu_local_intervalMillis) {
+    // BCU Local MSG 1: Operation Status (Priority=2, Msg=1)
+    uint32_t bcu_id_msg1 = createExtendedCANID(2, MODULE_NUM, 1);
+    packBCU_MSG1_OperationStatus(&sendMsg, bcu_id_msg1, &BMU_Package[BCU_LOCAL_INDEX]);
+    CAN32_sendCAN(&sendMsg, canbusready);
+
+    // BCU Local MSG 2: Cell 1-8 (Priority=2, Msg=2)
+    uint32_t bcu_id_msg2 = createExtendedCANID(2, MODULE_NUM, 2);
+    packBCU_MSG2_CellsLowSeries(&sendMsg, bcu_id_msg2, &BMU_Package[BCU_LOCAL_INDEX]);
+    CAN32_sendCAN(&sendMsg, canbusready);
+
+    // BCU Local MSG 3: Cell 9-10 (Priority=2, Msg=3)
+    uint32_t bcu_id_msg3 = createExtendedCANID(2, MODULE_NUM, 3);
+    packBCU_MSG3_CellsHighSeries(&sendMsg, bcu_id_msg3, &BMU_Package[BCU_LOCAL_INDEX]);
+    CAN32_sendCAN(&sendMsg, canbusready);
+
+    bcu_local_prevMillis = SESSION_TIME;
+  }
+
+  /*==================== BCU Local CAN TX: Fault Codes (1300ms) ====================*/
+
+  if (SESSION_TIME - bcu_local_prevFaultMillis >= bcu_local_faultIntervalMillis) {
+    // BCU Local MSG 4: Fault Code 1 - OV/LV (Priority=1, Msg=1)
+    uint32_t bcu_id_fault1 = createExtendedCANID(1, MODULE_NUM, 1);
+    packBCU_MSG4_FaultCode1(&sendMsg, bcu_id_fault1, &BMU_Package[BCU_LOCAL_INDEX]);
+    CAN32_sendCAN(&sendMsg, canbusready);
+
+    // BCU Local MSG 5: Fault Code 2 - Temp/DV (Priority=1, Msg=2)
+    uint32_t bcu_id_fault2 = createExtendedCANID(1, MODULE_NUM, 2);
+    packBCU_MSG5_FaultCode2(&sendMsg, bcu_id_fault2, &BMU_Package[BCU_LOCAL_INDEX]);
+    CAN32_sendCAN(&sendMsg, canbusready);
+
+    bcu_local_prevFaultMillis = SESSION_TIME;
+  }
+
   /*==================== Real-time Connection Check ====================*/
 
   // Loop 1: Set BMUconnected (CAN-based BMUs only, BCU local is always connected)
@@ -305,9 +366,9 @@ void loop() {
   ACCUM_FULL = (AMS_Package.ACCUM_VOLTAGE >= 0.95f * ACCUM_MAXVOLTAGE);
   ACCUM_LOW = (AMS_Package.ACCUM_VOLTAGE >= 1.12f * ACCUM_MINVOLTAGE);
   OVER_VOLT_CRIT = (AMS_Package.OVERVOLT_CRITICAL > 0);
+  OVER_VOLT_WARN = (AMS_Package.OVERVOLT_WARNING > 0);
   LOW_VOLT_CRIT = (AMS_Package.LOWVOLT_CRITICAL > 0);
   LOW_VOLT_WARN = (AMS_Package.LOWVOLT_WARNING > 0);
-  LOW_VOLT_WARN = (AMS_Package.ACCUM_VOLTAGE <= 1.10f * ACCUM_MINVOLTAGE);
 
   // Temperature fault flags
   OVER_TEMP_CRIT = (AMS_Package.OVERTEMP_CRITICAL > 0);
@@ -636,13 +697,14 @@ void debugAMSstate() {
   Serial.printf("AMS_VOLT: %.2f Low: %d Full: %d \n", AMS_Package.ACCUM_VOLTAGE,ACCUM_LOW,ACCUM_FULL);
   Serial.printf("AMS_MAX: %.2f \n", AMS_Package.ACCUM_MAXVOLTAGE);
   Serial.printf("AMS_MIN: %.2f\n", AMS_Package.ACCUM_MINVOLTAGE);
+  Serial.printf("OV_WARN: %d\n", OVER_VOLT_WARN);
   Serial.printf("OV_CRIT: %d\n", OVER_VOLT_CRIT);
-  Serial.printf("LV_CRIT: %d\n", LOW_VOLT_CRIT);
   Serial.printf("LV_WARN: %d\n", LOW_VOLT_WARN);
-  Serial.printf("OT_CRIT: %d\n", OVER_TEMP_CRIT);
+  Serial.printf("LV_CRIT: %d\n", LOW_VOLT_CRIT);
   Serial.printf("OT_WARN: %d\n", OVER_TEMP_WARN);
-  Serial.printf("DV_CRIT: %d\n", ACCUM_OverDivCritical);
+  Serial.printf("OT_CRIT: %d\n", OVER_TEMP_CRIT);
   Serial.printf("DV_WARN: %d\n", ACCUM_OverDivWarn);
+  Serial.printf("DV_CRIT: %d\n", ACCUM_OverDivCritical);
 }
 
 void debugBMUMod(int moduleNum) {
@@ -684,4 +746,160 @@ void debugOBCmsg() {
   if (obcstatbitarray[2]) Serial.println("  AC Reversed");
   if (obcstatbitarray[3]) Serial.println("  No Battery");
   if (obcstatbitarray[4]) Serial.println("  Comm Timeout");
+}
+
+/************************* BCU Local CAN TX Message Packing ***************************/
+
+// BCU Local MSG 1: Module Operation & Voltage Status
+// Byte 0: BMU Enter Charging Mode (0=NO, 1=YES)
+// Byte 1-2: Cells in Balancing (10-bit, MSB first)
+// Byte 3: Averaged Cell Voltage Difference DV (factor 0.1V)
+// Byte 4: Temp Sensor 1 (offset -40, factor 0.5C)
+// Byte 5: Temp Sensor 2 (offset -40, factor 0.5C)
+// Byte 6-7: Reserved
+void packBCU_MSG1_OperationStatus(twai_message_t* msg, uint32_t id, BMUdata* localModule) {
+  msg->identifier = id;
+  msg->extd = 1;
+  msg->rtr = 0;
+  msg->data_length_code = 8;
+
+  msg->data[0] = localModule->BMUreadytoCharge ? 1 : 0;
+  msg->data[1] = (localModule->BalancingDischarge_Cells >> 8) & 0xFF;
+  msg->data[2] = localModule->BalancingDischarge_Cells & 0xFF;
+  msg->data[3] = localModule->DV;
+  msg->data[4] = localModule->TEMP_SENSE[0];
+  msg->data[5] = localModule->TEMP_SENSE[1];
+  msg->data[6] = 0x00;
+  msg->data[7] = 0x00;
+}
+
+// BCU Local MSG 2: Cell Monitoring LOW SERIES
+// Byte 0-7: Cell 1-8 voltages (factor 0.02V)
+void packBCU_MSG2_CellsLowSeries(twai_message_t* msg, uint32_t id, BMUdata* localModule) {
+  msg->identifier = id;
+  msg->extd = 1;
+  msg->rtr = 0;
+  msg->data_length_code = 8;
+
+  for (int i = 0; i < 8; i++) {
+    msg->data[i] = localModule->V_CELL[i];
+  }
+}
+
+// BCU Local MSG 3: Cell Monitoring HIGH SERIES
+// Byte 0-1: Cell 9-10 voltages (factor 0.02V)
+// Byte 2-7: Reserved
+void packBCU_MSG3_CellsHighSeries(twai_message_t* msg, uint32_t id, BMUdata* localModule) {
+  msg->identifier = id;
+  msg->extd = 1;
+  msg->rtr = 0;
+  msg->data_length_code = 8;
+
+  msg->data[0] = localModule->V_CELL[8];
+  msg->data[1] = localModule->V_CELL[9];
+  msg->data[2] = 0x00;
+  msg->data[3] = 0x00;
+  msg->data[4] = 0x00;
+  msg->data[5] = 0x00;
+  msg->data[6] = 0x00;
+  msg->data[7] = 0x00;
+}
+
+// BCU Local MSG 4: Module Fault Code 1
+// Byte 0-1: Over Voltage Warning (10-bit, MSB first)
+// Byte 2-3: Over Voltage Critical (10-bit, MSB first)
+// Byte 4-5: Low Voltage Warning (10-bit, MSB first)
+// Byte 6-7: Low Voltage Critical (10-bit, MSB first)
+void packBCU_MSG4_FaultCode1(twai_message_t* msg, uint32_t id, BMUdata* localModule) {
+  msg->identifier = id;
+  msg->extd = 1;
+  msg->rtr = 0;
+  msg->data_length_code = 8;
+
+  msg->data[0] = (localModule->OVERVOLTAGE_WARNING >> 8) & 0xFF;
+  msg->data[1] = localModule->OVERVOLTAGE_WARNING & 0xFF;
+  msg->data[2] = (localModule->OVERVOLTAGE_CRITICAL >> 8) & 0xFF;
+  msg->data[3] = localModule->OVERVOLTAGE_CRITICAL & 0xFF;
+  msg->data[4] = (localModule->LOWVOLTAGE_WARNING >> 8) & 0xFF;
+  msg->data[5] = localModule->LOWVOLTAGE_WARNING & 0xFF;
+  msg->data[6] = (localModule->LOWVOLTAGE_CRITICAL >> 8) & 0xFF;
+  msg->data[7] = localModule->LOWVOLTAGE_CRITICAL & 0xFF;
+}
+
+// BCU Local MSG 5: Module Fault Code 2
+// Byte 0-1: Over Temp Warning (10-bit, MSB first)
+// Byte 2-3: Over Temp Critical (10-bit, MSB first)
+// Byte 4-5: Over Div Voltage Warning (10-bit, MSB first)
+// Byte 6-7: Over Div Voltage Critical (10-bit, MSB first)
+void packBCU_MSG5_FaultCode2(twai_message_t* msg, uint32_t id, BMUdata* localModule) {
+  msg->identifier = id;
+  msg->extd = 1;
+  msg->rtr = 0;
+  msg->data_length_code = 8;
+
+  msg->data[0] = (localModule->OVERTEMP_WARNING >> 8) & 0xFF;
+  msg->data[1] = localModule->OVERTEMP_WARNING & 0xFF;
+  msg->data[2] = (localModule->OVERTEMP_CRITICAL >> 8) & 0xFF;
+  msg->data[3] = localModule->OVERTEMP_CRITICAL & 0xFF;
+  msg->data[4] = (localModule->OVERDIV_VOLTAGE_WARNING >> 8) & 0xFF;
+  msg->data[5] = localModule->OVERDIV_VOLTAGE_WARNING & 0xFF;
+  msg->data[6] = (localModule->OVERDIV_VOLTAGE_CRITICAL >> 8) & 0xFF;
+  msg->data[7] = localModule->OVERDIV_VOLTAGE_CRITICAL & 0xFF;
+}
+
+/************************* BCU Local Cell Balancing ***************************/
+
+// Passive cell balancing using LTC6811 discharge resistors
+// Returns boolean array where true = cell is being balanced (index 0 = Cell 1)
+bool* balanceLocalCells(float vmaxCell, float vminCell, float tempMaxCell, float dvMax) {
+  // Initialize all cells as not balancing
+  for (int i = 0; i < NUM_CELLS; i++) {
+    balancingStatus[i] = false;
+  }
+
+  BMUdata* localModule = &BMU_Package[BCU_LOCAL_INDEX];
+
+  if (!localModule->BMUreadytoCharge) {
+    // Clear LTC6811 discharge when not charging
+    bms_ic[0].config.tx_data[4] = 0;
+    bms_ic[0].config.tx_data[5] &= 0xFC;
+    LTC6811_wrcfg(TOTAL_IC, bms_ic);
+
+    localModule->BalancingDischarge_Cells = toUint16FromBitarrayMSB(balancingStatus);
+    return balancingStatus;
+  }
+
+  float avgV = calculateLocalAvgVoltage();
+
+  // Identify cells for balancing
+  for (int i = 0; i < NUM_CELLS; i++) {
+    float cellDV = fabs(cellvoltages[i] - avgV);
+
+    // Only balance if:
+    // 1. Cell voltage is above average + threshold
+    // 2. Cell is not already at or below minimum voltage
+    // 3. Cell voltage deviation from avg is within safe range
+    if (cellvoltages[i] > (avgV + BALANCE_THRESHOLD) &&
+        cellvoltages[i] > vminCell &&
+        cellDV < (dvMax * 1.5f)) {
+      balancingStatus[i] = true;
+    }
+  }
+
+  // Convert boolean array to uint16_t for CAN message (MSB-first format)
+  localModule->BalancingDischarge_Cells = toUint16FromBitarrayMSB(balancingStatus);
+
+  // Configure LTC6811 discharge (DCC bits are LSB-first: bit 0 = Cell 1)
+  uint16_t dischargeBits = toUint16FromBitarrayLSB(balancingStatus);
+  bms_ic[0].config.tx_data[4] = dischargeBits & 0xFF;
+  bms_ic[0].config.tx_data[5] = (bms_ic[0].config.tx_data[5] & 0xFC) |
+                                 ((dischargeBits >> 8) & 0x03);
+  LTC6811_wrcfg(TOTAL_IC, bms_ic);
+
+  if (dischargeBits != 0) {
+    Serial.printf("BCU Local Balancing: 0x%03X (avg=%.3fV, CAN=0x%03X)\n",
+                  dischargeBits, avgV, localModule->BalancingDischarge_Cells);
+  }
+
+  return balancingStatus;
 }
