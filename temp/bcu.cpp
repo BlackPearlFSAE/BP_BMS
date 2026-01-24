@@ -86,7 +86,7 @@ bool BMUUpdateFlag = false;
 
 /************************* Function Declarations ***************************/
 void mockBMUData();
-void packBCU_toAMSmsg(twai_message_t *BCUsent, uint16_t bcu_transimission_time, bool is_charger_plugged);
+void packBCU_toBMUmsg(twai_message_t *BCUsent, uint16_t bcu_transimission_time, bool is_charger_plugged);
 void packBCU_toOBCmsg(twai_message_t *BCUsent, bool AMS_OK, bool ReadytoCharge, bool OverDivCritical_Yes, bool Voltage_is_Full);
 void processReceived_BMUmsg(twai_message_t *receivedframe, BMUdata *BMU_Package);
 void processReceived_OBCmsg(twai_message_t *receivedframe);
@@ -160,7 +160,7 @@ void loop() {
   // Broadcast to BMUs (every 1000ms)
   if (CAN_SEND_FLG1) {
     CAN_SEND_FLG1 = false;
-    packBCU_toAMSmsg(&sendMsg, BMS_COMMUNICATE_TIME, CHARGER_PLUGGED);
+    packBCU_toBMUmsg(&sendMsg, BMS_COMMUNICATE_TIME, CHARGER_PLUGGED);
     CAN32_sendCAN(&sendMsg, canbusready);
   }
 
@@ -295,7 +295,7 @@ void loop() {
 
 /************************* CAN Message Packing ***************************/
 
-void packBCU_toAMSmsg(twai_message_t *BCUsent, uint16_t bcu_transimission_time, bool is_charger_plugged) {
+void packBCU_toBMUmsg(twai_message_t *BCUsent, uint16_t bcu_transimission_time, bool is_charger_plugged) {
   uint8_t* transmission_time = splitHLbyte(bcu_transimission_time);
   BCUsent->identifier = BCU_ADD;
   BCUsent->data_length_code = 8;
@@ -349,7 +349,7 @@ void processReceived_BMUmsg(twai_message_t *receivedframe, BMUdata *BMU_Package)
   if (decodedCANID.PRIORITY == 0x02) {
     switch (decodedCANID.MSG_NUM) {
       case 1:  // Operation status
-        BMU_Package[i].BMUreadytoCharge = receivedframe->data[0];
+        BMU_Package[i].BMUneedBalance = receivedframe->data[0];
         BMU_Package[i].BalancingDischarge_Cells = mergeHLbyte(receivedframe->data[1], receivedframe->data[2]);
         BMU_Package[i].DV = receivedframe->data[3];
         BMU_Package[i].TEMP_SENSE[0] = receivedframe->data[4];
@@ -412,7 +412,7 @@ void packing_AMSstruct(int moduleIndex) {
   AMS_Package.OVERDIV_CRITICAL |= BMU_Package[k].OVERDIV_VOLTAGE_CRITICAL;
 
   // AND together charge ready (all must be ready)
-  AMS_Package.ACCUM_CHG_READY &= BMU_Package[k].BMUreadytoCharge;
+  AMS_Package.ACCUM_CHG_READY &= BMU_Package[k].BMUneedBalance;
 }
 
 void resetAllStruct() {
@@ -468,7 +468,7 @@ void debugBMUMod(int moduleNum) {
     BMU_Package[moduleNum].TEMP_SENSE[0] * 0.0125f + 2,
     BMU_Package[moduleNum].TEMP_SENSE[1] * 0.0125f + 2);
   Serial.printf("Ready to Charge: %d, Connected: %d\n",
-    BMU_Package[moduleNum].BMUreadytoCharge,
+    BMU_Package[moduleNum].BMUneedBalance,
     BMU_Package[moduleNum].BMUconnected);
 
   Serial.printf("Faults - OV:%X/%X LV:%X/%X OT:%X/%X DV:%X/%X\n",
@@ -500,7 +500,7 @@ void mockBMUData() {
     for (int i = 0; i < MODULE_NUM / 2; i++) {
         BMU_Package[i].BMU_ID = 0x18200001 + (i << 16);
         BMU_Package[i].BMUconnected = true;
-        BMU_Package[i].BMUreadytoCharge = 1;
+        BMU_Package[i].BMUneedBalance = 1;
         BMU_Package[i].DV = 5;  // 0.5V diff (5 * 0.1)
         BMU_Package[i].TEMP_SENSE[0] = 0xC8;  // ~25C
         BMU_Package[i].TEMP_SENSE[1] = 0xC8;
@@ -528,7 +528,7 @@ void mockBMUData() {
     for (int i = MODULE_NUM / 2; i < MODULE_NUM; i++) {
         BMU_Package[i].BMU_ID = 0x18200001 + (i << 16);
         BMU_Package[i].BMUconnected = true;
-        BMU_Package[i].BMUreadytoCharge = 0;  // Not ready
+        BMU_Package[i].BMUneedBalance = 0;  // Not ready
         BMU_Package[i].DV = 15;  // 1.5V diff - high deviation
         BMU_Package[i].TEMP_SENSE[0] = 0xFA;  // Hot ~60C
         BMU_Package[i].TEMP_SENSE[1] = 0xD0;  // Warm ~40C
