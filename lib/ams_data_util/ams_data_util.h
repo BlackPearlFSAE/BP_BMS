@@ -25,7 +25,7 @@
 #define STANDARD_BIT_RATE TWAI_TIMING_CONFIG_250KBITS()
 #define OBC_COMMUNICATE_TIME  500
 #define BMS_COMMUNICATE_TIME  1000
-#define DISCONNENCTION_TIMEOUT BMS_COMMUNICATE_TIME * 1.5
+#define DISCONNENCTION_TIMEOUT BMS_COMMUNICATE_TIME * 2.3
 #define BCU_ADD 0x18000000
 #define OBC_ADD 0x1806E5F4
 
@@ -72,7 +72,7 @@ struct AMSdata {
   bool OVERDIV_CRITICAL = 0;
 
   // bool AMS_OK = 0; // Use this for Active Low Output
-  bool AMS_OK = 1; // Use this for Active High Output
+  bool AMS_OK = 0; // Use this for Active High Output
 };
 
 // Physical condition of OBC On board charger

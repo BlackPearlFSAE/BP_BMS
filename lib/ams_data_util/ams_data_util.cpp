@@ -4,13 +4,15 @@
 #include <ams_data_util.h>
 
 void debugAMSstate(AMSdata* myAMS) {
+  float accumvolt = myAMS->ACCUM_VOLTAGE;
+
+  Serial.printf("AMS_VOLTAGE: %.2f \n",myAMS->ACCUM_VOLTAGE);
+  Serial.printf("MIN_Voltage: %.2f MAX_Voltage: %.2f\n", 
+    myAMS->ACCUM_MINVOLTAGE,myAMS->ACCUM_MAXVOLTAGE);
+  Serial.printf("--Fault status of AMS--\n",MODULE_NUM);
   Serial.printf("AMS_OK: %d\n", myAMS->AMS_OK);
-  Serial.printf("AMS_VOLT: %.2f Low: %d Full: %d \n", myAMS->ACCUM_VOLTAGE);
-  Serial.printf("AMS_MAX: %.2f \n", myAMS->ACCUM_MAXVOLTAGE);
-  Serial.printf("AMS_MIN: %.2f\n", myAMS->ACCUM_MINVOLTAGE);
-
+  
   Serial.printf("--Fault status of [%d] Modules--\n",MODULE_NUM);
-
   Serial.print("OV_WARN: ");
   Serial.println(myAMS->OVERVOLT_WARNING, BIN);
   Serial.print("OV_CRIT: ");
@@ -27,6 +29,7 @@ void debugAMSstate(AMSdata* myAMS) {
   Serial.println(myAMS->OVERDIV_WARNING, BIN);
   Serial.print("DV_CRIT: ");
   Serial.println(myAMS->OVERDIV_CRITICAL, BIN);
+  Serial.println();
 }
 
 void debugBMUModule(BMUdata* myBMU,int moduleNum) {
@@ -39,8 +42,8 @@ void debugBMUModule(BMUdata* myBMU,int moduleNum) {
 
   Serial.printf("DV: %.2fV\n", myBMU[moduleNum].DV * 0.2f);
   Serial.printf("TEMP: %.1fv, %.1fv\n",
-    myBMU[moduleNum].TEMP_SENSE[0] * 0.0125f + 2,
-    myBMU[moduleNum].TEMP_SENSE[1] * 0.0125f + 2);
+    myBMU[moduleNum].TEMP_SENSE[0] * 0.1,
+    myBMU[moduleNum].TEMP_SENSE[1] * 0.1);
   Serial.printf("Ready to Charge: %d, Connected: %d\n",
     myBMU[moduleNum].BMUneedBalance,
     myBMU[moduleNum].BMUconnected);

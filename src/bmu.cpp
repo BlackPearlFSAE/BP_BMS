@@ -61,7 +61,7 @@ float dVmax = DVMAX;
 // Calculated fault thresholds (updated by updateThresholds())
 float OV_WARNING_THRESHOLD;     // 0.95 * VmaxCell
 float OV_CRITICAL_THRESHOLD;    // VmaxCell
-float LV_WARNING_THRESHOLD;     // VminCell + 0.2
+float LV_WARNING_THRESHOLD;     // 1.12 * VminCell
 float LV_CRITICAL_THRESHOLD;    // VminCell
 float TEMP_WARNING_THRESHOLD;   // 0.8 * TempMaxCell
 float TEMP_CRITICAL_THRESHOLD;  // 0.9 * TempMaxCell
@@ -76,7 +76,7 @@ float currentTemp2 = 25.0f;
 bool balancingStatus[NUM_CELLS];
 
 // BMU Module Number (set before flashing each BMU)
-int ModuleNumber = 1;
+int ModuleNumber = 8;
 
 // Timing
 unsigned long prevMillis = 0;

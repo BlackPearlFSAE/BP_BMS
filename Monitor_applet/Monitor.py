@@ -1,102 +1,97 @@
 #!/usr/bin/env python3
 """
-BP17 BMS CAN Monitor
-====================
-Real-time monitoring GUI for Battery Management System via Serial/CAN interface.
-Displays cell voltages, temperatures, balancing status, and fault codes.
+BP16B BMS CAN Monitor
+=====================
+Real-time monitoring GUI for Battery Management System via CAN bus.
+Implements BCU-equivalent fault monitoring logic from bcu.cpp.
 
-Protocol: Extended CAN ID (29-bit)
-  BCU:  0x180000XX
-  BMU:  0x18[Prio][Module]00[Msg]
+Fault conditions (matching BCU):
+1. Communication timeout - no CAN messages for DISCONNECT_TIMEOUT
+2. Module disconnection - any BMU not responding
+3. Critical faults - OV/LV/OT/DV critical flags from any module
 
 Usage:
-  python bms_monitor.py [--port /dev/ttyUSB0] [--baud 115200] [--demo]
+    python Monitor.py --demo                                    # Demo mode
+    python Monitor.py --can slcan --channel /dev/ttyACM0        # USB adapter
+    python Monitor.py --can pcan --channel PCAN_USBBUS1         # PCAN
+    python Monitor.py --can socketcan --channel can0            # Linux SocketCAN
 """
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-import struct
 import threading
 import time
 import argparse
 import random
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List
-from collections import deque
+from typing import Optional, Dict, List, Callable
+from enum import Enum
 
-# Try importing serial, provide fallback for demo mode
+# python-can import
 try:
-    import serial
-    import serial.tools.list_ports
-    SERIAL_AVAILABLE = True
+    import can
+    CAN_AVAILABLE = True
 except ImportError:
-    SERIAL_AVAILABLE = False
-    print("Warning: pyserial not installed. Running in demo mode only.")
-
-
-# =============================================================================
-# CAN Protocol Definitions (Extended 29-bit IDs)
-# =============================================================================
-
-class CANProtocol:
-    """Extended CAN ID structure: 0x18[Prio][Module]00[Msg]"""
-    
-    # Base prefix for BMS
-    BMS_PREFIX = 0x18000000
-    
-    # Priority levels (lower = higher priority in CAN arbitration)
-    PRIO_BCU = 0x0        # BCU commands (highest)
-    PRIO_FAULT = 0x1      # Fault messages
-    PRIO_DATA = 0x2       # Normal data
-    
-    # Message types
-    MSG_STATUS = 0x01     # Status + Balancing + dV + Temps
-    MSG_CELLS_LO = 0x02   # Cell 1-8 voltages
-    MSG_CELLS_HI = 0x03   # Cell 9-10 voltages
-    MSG_FAULT_1 = 0x01    # OV/LV faults (with PRIO_FAULT)
-    MSG_FAULT_2 = 0x02    # Temp/dV faults (with PRIO_FAULT)
-    
-    # BCU Command ID
-    BCU_COMMAND = 0x180000FF
-    
-    @staticmethod
-    def build_id(priority: int, module: int, msg: int) -> int:
-        """Build extended CAN ID from components."""
-        return 0x18000000 | (priority << 20) | (module << 16) | msg
-    
-    @staticmethod
-    def parse_id(can_id: int) -> tuple:
-        """Parse extended CAN ID into (priority, module, msg)."""
-        if (can_id & 0xFF000000) != 0x18000000:
-            return None, None, None
-        priority = (can_id >> 20) & 0xF
-        module = (can_id >> 16) & 0xF
-        msg = can_id & 0xFF
-        return priority, module, msg
-
+    CAN_AVAILABLE = False
+    print("Warning: python-can not installed. Use: pip install python-can")
 
 # =============================================================================
-# Data Structures
+# Runtime Configuration
 # =============================================================================
+class Config:
+    """Runtime configuration - matches BCU parameters from ams_data_util.h"""
+    CELL_NUM = 10
+    MODULE_NUM = 8
+    CAN_BITRATE = 250000
+    DISCONNECT_TIMEOUT = 1.5  # seconds (DISCONNENCTION_TIMEOUT in BCU)
 
+    # Voltage thresholds (from bcu.cpp defaults)
+    CELL_V_HIGH = 4.15  # VMAX_CELL
+    CELL_V_LOW = 3.3    # VMIN_CELL
+    TEMP_MAX = 60       # TEMP_MAX_CELL
+    DV_MAX = 0.5        # DVMAX (500mV)
+
+# =============================================================================
+# Theme
+# =============================================================================
+C = {
+    'bg': '#1d1d1d', 'panel': '#2d2d2d', 'cell': '#353535', 'header': '#252525',
+    'accent': '#ff7f00', 'accent_dim': '#cc6600', 'ok': '#33cc33',
+    'warn': '#ff9500', 'crit': '#ff3333', 'text': '#e0e0e0', 'dim': '#808080',
+    'border': '#454545', 'disconn': '#555555', 'bal': '#00aaff',
+}
+
+FAULT_TYPES = [
+    ('ov_warning', 'OV Warn', False), ('ov_critical', 'OV Crit', True),
+    ('lv_warning', 'LV Warn', False), ('lv_critical', 'LV Crit', True),
+    ('ot_warning', 'OT Warn', False), ('ot_critical', 'OT Crit', True),
+    ('odv_warning', 'DV Warn', False), ('odv_critical', 'DV Crit', True),
+]
+
+# =============================================================================
+# AMS Fault Reason (matches BCU logic)
+# =============================================================================
+class FaultReason(Enum):
+    NONE = "OK"
+    NO_COMMUNICATION = "NO CAN RX"
+    MODULE_DISCONNECTED = "BMU OFFLINE"
+    OVERVOLT_CRITICAL = "OV CRIT"
+    LOWVOLT_CRITICAL = "LV CRIT"
+    OVERTEMP_CRITICAL = "OT CRIT"
+    OVERDIV_CRITICAL = "DV CRIT"
+
+# =============================================================================
+# Data Model
+# =============================================================================
 @dataclass
 class BMUData:
-    """Data container for a single Battery Management Unit."""
+    """BMU module data - matches BMUdata struct in ams_data_util.h"""
     module_id: int
-    
-    # Cell voltages (10 cells per module)
-    cell_voltages: List[float] = field(default_factory=lambda: [0.0] * 10)
-    
-    # Status
-    charging_mode: bool = False
-    balancing_cells: int = 0  # 10-bit bitmap
-    delta_v: float = 0.0      # Voltage difference
-    
-    # Temperatures
-    temp_sensor_1: float = 0.0
-    temp_sensor_2: float = 0.0
-    
-    # Fault flags (10-bit bitmaps each)
+    cell_voltages: List[float] = field(default_factory=list)
+    balancing_cells: int = 0
+    need_balance: bool = False
+    delta_v: float = 0.0
+    temps: List[float] = field(default_factory=lambda: [0.0, 0.0])
     ov_warning: int = 0
     ov_critical: int = 0
     lv_warning: int = 0
@@ -105,977 +100,976 @@ class BMUData:
     ot_critical: int = 0
     odv_warning: int = 0
     odv_critical: int = 0
-    
-    # Timestamps
     last_update: float = 0.0
-    last_fault_update: float = 0.0
-    
-    def get_min_cell_voltage(self) -> float:
-        return min(self.cell_voltages) if self.cell_voltages else 0.0
-    
-    def get_max_cell_voltage(self) -> float:
-        return max(self.cell_voltages) if self.cell_voltages else 0.0
-    
-    def get_total_voltage(self) -> float:
+
+    def __post_init__(self):
+        if not self.cell_voltages:
+            self.cell_voltages = [0.0] * Config.CELL_NUM
+
+    def total_v(self) -> float:
         return sum(self.cell_voltages)
-    
-    def has_any_fault(self) -> bool:
-        return any([
-            self.ov_warning, self.ov_critical,
-            self.lv_warning, self.lv_critical,
-            self.ot_warning, self.ot_critical,
-            self.odv_warning, self.odv_critical
-        ])
-    
-    def has_critical_fault(self) -> bool:
-        return any([
-            self.ov_critical, self.lv_critical,
-            self.ot_critical, self.odv_critical
-        ])
 
+    def is_connected(self) -> bool:
+        if self.last_update == 0:
+            return False
+        return (time.time() - self.last_update) < Config.DISCONNECT_TIMEOUT
 
-# =============================================================================
-# Serial Frame Parser
-# =============================================================================
+    def has_warning(self) -> bool:
+        return any([self.ov_warning, self.lv_warning, self.ot_warning, self.odv_warning])
 
-class CANFrameParser:
-    """
-    Parse incoming serial data into CAN frames.
-    
-    Expected format (configurable):
-    - ASCII: "18210001#AABBCCDDEEFF0011\n"  (ID#DATA)
-    - Binary: [0x18][0x21][0x00][0x01][DLC][DATA...]
-    """
-    
-    def __init__(self, format_type='ascii'):
-        self.format_type = format_type
-        self.buffer = bytearray()
-    
-    def feed(self, data: bytes) -> List[tuple]:
-        """Feed raw bytes, return list of (can_id, data_bytes) tuples."""
-        frames = []
-        self.buffer.extend(data)
-        
-        if self.format_type == 'ascii':
-            frames = self._parse_ascii()
-        else:
-            frames = self._parse_binary()
-        
-        return frames
-    
-    def _parse_ascii(self) -> List[tuple]:
-        """Parse ASCII format: ID#HEXDATA\n"""
-        frames = []
-        
-        while b'\n' in self.buffer:
-            line_end = self.buffer.index(b'\n')
-            line = self.buffer[:line_end].decode('ascii', errors='ignore').strip()
-            self.buffer = self.buffer[line_end + 1:]
-            
-            if '#' in line:
-                try:
-                    id_str, data_str = line.split('#')
-                    can_id = int(id_str, 16)
-                    data = bytes.fromhex(data_str)
-                    frames.append((can_id, data))
-                except (ValueError, IndexError):
-                    pass
-        
-        return frames
-    
-    def _parse_binary(self) -> List[tuple]:
-        """Parse binary format: [ID:4][DLC:1][DATA:DLC]"""
-        frames = []
-        
-        while len(self.buffer) >= 5:  # Minimum: 4 byte ID + 1 byte DLC
-            can_id = struct.unpack('>I', self.buffer[:4])[0]
-            dlc = self.buffer[4]
-            
-            if dlc > 8:
-                self.buffer.pop(0)  # Invalid DLC, shift buffer
-                continue
-            
-            if len(self.buffer) < 5 + dlc:
-                break  # Wait for more data
-            
-            data = bytes(self.buffer[5:5 + dlc])
-            self.buffer = self.buffer[5 + dlc:]
-            frames.append((can_id, data))
-        
-        return frames
+    def has_critical(self) -> bool:
+        return any([self.ov_critical, self.lv_critical, self.ot_critical, self.odv_critical])
 
+    def has_fault(self) -> bool:
+        return self.has_warning() or self.has_critical()
+
+    def cell_fault(self, attr: str, idx: int) -> bool:
+        """Check if specific cell has fault (MSB first like BCU)"""
+        bitmap = getattr(self, attr, 0)
+        bit_position = 9 - idx  # MSB first
+        return bool(bitmap & (1 << bit_position))
 
 # =============================================================================
-# BMS Data Decoder
+# BMS Decoder with BCU-equivalent fault logic
 # =============================================================================
-
 class BMSDecoder:
-    """Decode CAN frames into BMU data structures."""
-    
-    def __init__(self, num_modules: int = 8):
-        self.modules: Dict[int, BMUData] = {
-            i: BMUData(module_id=i) for i in range(1, num_modules + 1)
-        }
-    
-    def decode_frame(self, can_id: int, data: bytes) -> Optional[int]:
+    """
+    Decodes CAN messages and determines AMS_OK status.
+    Implements same fault logic as BCU main loop in bcu.cpp.
+    """
+
+    def __init__(self, module_count: int = None):
+        self.module_count = module_count or Config.MODULE_NUM
+        self.modules: Dict[int, BMUData] = {}
+        self._rebuild_modules()
+
+        # AMS status (matches BCU)
+        self.ams_ok = False  # Start false until we have valid data
+        self.fault_reason = FaultReason.NO_COMMUNICATION
+        self.last_rx_time = 0.0
+
+        # Aggregate data
+        self.accum_voltage = 0.0
+        self.min_cell_v = 0.0
+        self.max_cell_v = 0.0
+        self.pack_delta_v = 0.0
+        self.max_temp = 0.0
+        self.connected_count = 0
+        self.fault_count = 0
+
+    def _rebuild_modules(self):
+        """Rebuild module dict when count changes"""
+        self.modules = {i: BMUData(module_id=i) for i in range(1, self.module_count + 1)}
+
+    def set_module_count(self, count: int):
+        """Update module count at runtime"""
+        if count != self.module_count:
+            self.module_count = count
+            Config.MODULE_NUM = count
+            self._rebuild_modules()
+
+    def decode(self, can_id: int, data: bytes) -> Optional[int]:
         """
-        Decode a CAN frame and update the corresponding BMU.
-        Returns the module ID if successfully decoded, None otherwise.
+        Decode CAN message. Returns module_id if valid, None otherwise.
+        CAN ID format: 0x18[Prio:4][Module:4]00[Msg:4]
         """
-        priority, module, msg = CANProtocol.parse_id(can_id)
-        
-        if module is None or module < 1 or module > 8:
+        # Check extended ID prefix
+        if (can_id & 0xFF000000) != 0x18000000:
             return None
-        
-        bmu = self.modules.get(module)
-        if bmu is None:
+
+        prio = (can_id >> 20) & 0xF
+        mod = (can_id >> 16) & 0xF
+        msg = can_id & 0xFF
+
+        if mod < 1 or mod > self.module_count:
             return None
-        
+
+        bmu = self.modules[mod]
         now = time.time()
-        
-        if priority == CANProtocol.PRIO_DATA:
-            if msg == CANProtocol.MSG_STATUS:
-                self._decode_status(bmu, data)
-                bmu.last_update = now
-            elif msg == CANProtocol.MSG_CELLS_LO:
-                self._decode_cells_lo(bmu, data)
-                bmu.last_update = now
-            elif msg == CANProtocol.MSG_CELLS_HI:
-                self._decode_cells_hi(bmu, data)
-                bmu.last_update = now
-        
-        elif priority == CANProtocol.PRIO_FAULT:
-            if msg == CANProtocol.MSG_FAULT_1:
-                self._decode_fault_1(bmu, data)
-                bmu.last_fault_update = now
-            elif msg == CANProtocol.MSG_FAULT_2:
-                self._decode_fault_2(bmu, data)
-                bmu.last_fault_update = now
-        
-        return module
-    
-    def _decode_status(self, bmu: BMUData, data: bytes):
-        """Decode MSG1: Status + Balancing + dV + Temps"""
-        if len(data) < 6:
-            return
-        
-        # Byte 0: Charging mode flag
-        bmu.charging_mode = bool(data[0] & 0x01)
-        
-        # Byte 1-2: Balancing cells (10-bit bitmap, MSB first)
-        bmu.balancing_cells = ((data[1] << 8) | data[2]) >> 6  # Top 10 bits
-        
-        # Byte 3: Delta V (0-0.2V, factor 0.1)
-        bmu.delta_v = data[3] * 0.1
-        
-        # Byte 4-5: Temp sensors (offset 2, factor 0.0125)
-        bmu.temp_sensor_1 = 2.0 + data[4] * 0.0125
-        bmu.temp_sensor_2 = 2.0 + data[5] * 0.0125
-    
-    def _decode_cells_lo(self, bmu: BMUData, data: bytes):
-        """Decode MSG2: Cell 1-8 voltages"""
-        for i in range(min(8, len(data))):
-            # Raw value to voltage: factor 0.02
-            bmu.cell_voltages[i] = data[i] * 0.02
-    
-    def _decode_cells_hi(self, bmu: BMUData, data: bytes):
-        """Decode MSG3: Cell 9-10 voltages"""
-        for i in range(min(2, len(data))):
-            bmu.cell_voltages[8 + i] = data[i] * 0.02
-    
-    def _decode_fault_1(self, bmu: BMUData, data: bytes):
-        """Decode Fault MSG1: OV/LV warnings and critical"""
-        if len(data) < 8:
-            return
-        
-        # Each fault is 10-bit bitmap across 2 bytes
-        bmu.ov_warning = ((data[0] << 8) | data[1]) >> 6
-        bmu.ov_critical = ((data[2] << 8) | data[3]) >> 6
-        bmu.lv_warning = ((data[4] << 8) | data[5]) >> 6
-        bmu.lv_critical = ((data[6] << 8) | data[7]) >> 6
-    
-    def _decode_fault_2(self, bmu: BMUData, data: bytes):
-        """Decode Fault MSG2: Temp/dV warnings and critical"""
-        if len(data) < 8:
-            return
-        
-        bmu.ot_warning = ((data[0] << 8) | data[1]) >> 6
-        bmu.ot_critical = ((data[2] << 8) | data[3]) >> 6
-        bmu.odv_warning = ((data[4] << 8) | data[5]) >> 6
-        bmu.odv_critical = ((data[6] << 8) | data[7]) >> 6
+        self.last_rx_time = now
 
+        # Priority 0x02: Data messages (from bmu.cpp sendCellData)
+        if prio == 2:
+            if msg == 1 and len(data) >= 8:  # MSG1: Status
+                bmu.need_balance = bool(data[0])
+                bmu.balancing_cells = ((data[1] << 8) | data[2]) & 0x3FF
+                bmu.delta_v = data[3] * 0.1  # DV in 100mV units
+                # Temperature: 16-bit scaled by 10 (bmu.cpp line 421-426)
+                # Temp1: data[4-5], Temp2: data[6-7]
+                bmu.temps[0] = ((data[4] << 8) | data[5]) / 10.0
+                bmu.temps[1] = ((data[6] << 8) | data[7]) / 10.0
+                bmu.last_update = now
+
+            elif msg == 2 and len(data) >= 8:  # MSG2: Cells 1-8
+                for i in range(8):
+                    bmu.cell_voltages[i] = data[i] * 0.02  # 20mV per bit
+                bmu.last_update = now
+
+            elif msg == 3 and len(data) >= 2:  # MSG3: Cells 9-10
+                bmu.cell_voltages[8] = data[0] * 0.02
+                bmu.cell_voltages[9] = data[1] * 0.02
+                bmu.last_update = now
+
+        # Priority 0x01: Fault messages (from bmu.cpp sendFaultData)
+        elif prio == 1:
+            if msg == 1 and len(data) >= 8:  # Fault MSG1: OV/LV
+                bmu.ov_warning = ((data[0] << 8) | data[1]) & 0x3FF
+                bmu.ov_critical = ((data[2] << 8) | data[3]) & 0x3FF
+                bmu.lv_warning = ((data[4] << 8) | data[5]) & 0x3FF
+                bmu.lv_critical = ((data[6] << 8) | data[7]) & 0x3FF
+                bmu.last_update = now
+
+            elif msg == 2 and len(data) >= 8:  # Fault MSG2: OT/DV
+                bmu.ot_warning = ((data[0] << 8) | data[1]) & 0x3FF
+                bmu.ot_critical = ((data[2] << 8) | data[3]) & 0x3FF
+                bmu.odv_warning = ((data[4] << 8) | data[5]) & 0x3FF
+                bmu.odv_critical = ((data[6] << 8) | data[7]) & 0x3FF
+                bmu.last_update = now
+
+        return mod
+
+    def evaluate_ams_status(self) -> tuple:
+        """
+        Evaluate AMS_OK status using BCU logic from bcu.cpp main loop.
+        Returns (ams_ok, fault_reason)
+        """
+        now = time.time()
+
+        # Check 1: Complete communication loss (bcu.cpp line 210)
+        if self.last_rx_time == 0 or (now - self.last_rx_time) > Config.DISCONNECT_TIMEOUT:
+            return False, FaultReason.NO_COMMUNICATION
+
+        # Check 2: Any module disconnected (bcu.cpp line 221-240)
+        for bmu in self.modules.values():
+            if not bmu.is_connected():
+                return False, FaultReason.MODULE_DISCONNECTED
+
+        # Check 3: Critical faults (bcu.cpp line 287-288)
+        # ACCUMULATOR_Fault = OVER_VOLT_CRIT || LOW_VOLT_CRIT || OVER_TEMP_CRIT || ACCUM_OverDivCritical
+        for bmu in self.modules.values():
+            if bmu.ov_critical:
+                return False, FaultReason.OVERVOLT_CRITICAL
+            if bmu.lv_critical:
+                return False, FaultReason.LOWVOLT_CRITICAL
+            if bmu.ot_critical:
+                return False, FaultReason.OVERTEMP_CRITICAL
+            if bmu.odv_critical:
+                return False, FaultReason.OVERDIV_CRITICAL
+
+        return True, FaultReason.NONE
+
+    def aggregate(self):
+        """
+        Aggregate pack data and evaluate AMS status.
+        Called periodically like BCU's 500ms aggregation loop.
+        """
+        # Evaluate AMS status first
+        self.ams_ok, self.fault_reason = self.evaluate_ams_status()
+
+        # Aggregate statistics
+        all_voltages = []
+        all_temps = []
+        self.accum_voltage = 0.0
+        self.connected_count = 0
+        self.fault_count = 0
+
+        for bmu in self.modules.values():
+            if bmu.is_connected():
+                self.connected_count += 1
+                self.accum_voltage += bmu.total_v()
+
+                for v in bmu.cell_voltages:
+                    if v > 0:
+                        all_voltages.append(v)
+
+                for t in bmu.temps:
+                    if t > 0:
+                        all_temps.append(t)
+
+                if bmu.has_fault():
+                    self.fault_count += 1
+
+        if all_voltages:
+            self.min_cell_v = min(all_voltages)
+            self.max_cell_v = max(all_voltages)
+            self.pack_delta_v = self.max_cell_v - self.min_cell_v
+        else:
+            self.min_cell_v = self.max_cell_v = self.pack_delta_v = 0.0
+
+        self.max_temp = max(all_temps) if all_temps else 0.0
+
+    def reset(self):
+        """Reset all data (like BCU resetAllStruct)"""
+        self._rebuild_modules()
+        self.last_rx_time = 0.0
+        self.ams_ok = False
+        self.fault_reason = FaultReason.NO_COMMUNICATION
 
 # =============================================================================
-# Demo Data Generator
+# CAN Source
 # =============================================================================
+class CANSource:
+    def __init__(self, decoder: BMSDecoder):
+        self.decoder = decoder
+        self.bus: Optional['can.Bus'] = None
+        self.running = False
+        self.rx_count = 0
+        self.bitrate = Config.CAN_BITRATE
+        self.error_msg = ""
 
-class DemoDataGenerator:
-    """Generate realistic demo data for testing without hardware."""
-    
+    def connect(self, interface: str, channel: str, bitrate: int = None) -> bool:
+        if not CAN_AVAILABLE:
+            self.error_msg = "python-can not installed"
+            return False
+
+        self.bitrate = bitrate or Config.CAN_BITRATE
+        try:
+            kwargs = {'interface': interface, 'channel': channel}
+            if interface != 'socketcan':
+                kwargs['bitrate'] = self.bitrate
+            if interface == 'slcan':
+                kwargs['ttyBaudrate'] = 115200
+
+            self.bus = can.Bus(**kwargs)
+            self.running = True
+            self.rx_count = 0
+            threading.Thread(target=self._read_loop, daemon=True).start()
+            return True
+        except Exception as e:
+            self.error_msg = str(e)
+            print(f"CAN connect error: {e}")
+            return False
+
+    def disconnect(self):
+        self.running = False
+        if self.bus:
+            try:
+                self.bus.shutdown()
+            except:
+                pass
+            self.bus = None
+
+    def _read_loop(self):
+        while self.running and self.bus:
+            try:
+                msg = self.bus.recv(timeout=0.1)
+                if msg and msg.is_extended_id:
+                    if self.decoder.decode(msg.arbitration_id, msg.data):
+                        self.rx_count += 1
+            except Exception:
+                pass
+
+# =============================================================================
+# Demo Generator
+# =============================================================================
+class DemoGenerator:
     def __init__(self, decoder: BMSDecoder):
         self.decoder = decoder
         self.running = False
-        self.thread = None
-        self.time_offset = 0
-    
+
     def start(self):
         self.running = True
-        self.thread = threading.Thread(target=self._generate_loop, daemon=True)
-        self.thread.start()
-    
+        threading.Thread(target=self._loop, daemon=True).start()
+
     def stop(self):
         self.running = False
-        if self.thread:
-            self.thread.join(timeout=1.0)
-    
-    def _generate_loop(self):
+
+    def _loop(self):
+        t = 0
         while self.running:
-            self.time_offset += 0.1
-            
-            for module_id in range(1, 9):
-                bmu = self.decoder.modules[module_id]
-                
-                # Generate cell voltages (3.2V - 4.2V range with slight variation)
-                base_voltage = 3.7 + 0.3 * (module_id / 8)
-                for i in range(10):
-                    noise = random.gauss(0, 0.02)
-                    drift = 0.1 * (i / 10) * (1 + 0.5 * (module_id % 3))
-                    bmu.cell_voltages[i] = max(3.2, min(4.2, base_voltage + drift + noise))
-                
-                # Balancing simulation (random cells)
-                if random.random() < 0.1:
-                    bmu.balancing_cells = random.randint(0, 0x3FF)
-                
-                # Delta V
+            t += 0.5
+            for mid in range(1, self.decoder.module_count + 1):
+                if mid not in self.decoder.modules:
+                    continue
+                bmu = self.decoder.modules[mid]
+
+                # Generate cell voltages
+                base = 3.7 + 0.2 * (mid / self.decoder.module_count)
+                for i in range(Config.CELL_NUM):
+                    bmu.cell_voltages[i] = max(3.2, min(4.2, base + 0.05 * i + random.gauss(0, 0.02)))
+
                 bmu.delta_v = max(bmu.cell_voltages) - min(bmu.cell_voltages)
-                
-                # Temperatures (simulate heating during operation)
-                base_temp = 2.5 + 0.3 * (self.time_offset % 60) / 60
-                bmu.temp_sensor_1 = base_temp + random.gauss(0, 0.05)
-                bmu.temp_sensor_2 = base_temp + 0.1 + random.gauss(0, 0.05)
-                
-                # Occasional faults for demo
+                # Demo temps: realistic values between 25-35°C
+                bmu.temps = [25.0 + 5.0 * (t % 60) / 60 + random.gauss(0, 1),
+                             27.0 + 5.0 * (t % 60) / 60 + random.gauss(0, 1)]
+                bmu.balancing_cells = random.randint(0, 0x3FF) if random.random() < 0.05 else 0
+                bmu.need_balance = bmu.balancing_cells > 0
+
+                # Occasional warning faults for demo
                 if random.random() < 0.02:
-                    fault_cell = 1 << random.randint(0, 9)
-                    if random.random() < 0.7:
-                        bmu.ov_warning = fault_cell
-                    else:
-                        bmu.ov_warning = 0
-                
+                    bmu.ov_warning = 1 << random.randint(0, 9)
+                else:
+                    bmu.ov_warning = 0
+
                 bmu.last_update = time.time()
-            
-            time.sleep(0.5)  # 500ms update rate
+                self.decoder.last_rx_time = time.time()
 
+            time.sleep(0.5)
 
 # =============================================================================
-# GUI Application
+# Configuration Dialog
 # =============================================================================
+class ConfigDialog:
+    def __init__(self, parent, on_apply: Callable):
+        self.on_apply = on_apply
+        self.win = tk.Toplevel(parent)
+        self.win.title("Configuration")
+        self.win.geometry("320x200")
+        self.win.configure(bg=C['panel'])
+        self.win.resizable(False, False)
+        self.win.transient(parent)
+        self.win.grab_set()
 
-class BMSMonitorGUI:
-    """Main GUI application for BMS monitoring."""
-    
-    # Color scheme - Industrial/Technical aesthetic
-    COLORS = {
-        'bg_dark': '#0a0e14',
-        'bg_panel': '#141a22',
-        'bg_cell': '#1a2230',
-        'accent': '#00ff9f',
-        'accent_dim': '#00aa6f',
-        'warning': '#ffaa00',
-        'critical': '#ff3366',
-        'text': '#e0e0e0',
-        'text_dim': '#707080',
-        'border': '#2a3a4a',
-        'cell_ok': '#00cc7a',
-        'cell_low': '#ff9933',
-        'cell_high': '#ff3366',
-        'balance_on': '#00aaff',
-        'temp_cold': '#00aaff',
-        'temp_hot': '#ff6633',
-    }
-    
-    def __init__(self, root: tk.Tk, decoder: BMSDecoder, serial_port: Optional[str] = None):
-        self.root = root
-        self.decoder = decoder
-        self.serial_port = serial_port
-        self.serial_conn = None
-        self.parser = CANFrameParser(format_type='ascii')
-        self.running = False
-        self.demo_mode = False
-        self.demo_generator = None
-        
-        # Message log
-        self.message_log = deque(maxlen=100)
-        
-        self._setup_window()
+        # Center on parent
+        self.win.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - 320) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 200) // 2
+        self.win.geometry(f"+{x}+{y}")
+
         self._create_widgets()
-        self._start_update_loop()
-    
+
+    def _create_widgets(self):
+        # Title
+        tk.Label(self.win, text="Runtime Configuration", font=('Consolas', 12, 'bold'),
+                 fg=C['accent'], bg=C['panel']).pack(pady=(15, 10))
+
+        form = tk.Frame(self.win, bg=C['panel'])
+        form.pack(fill='x', padx=20)
+
+        # MODULE_NUM
+        row1 = tk.Frame(form, bg=C['panel'])
+        row1.pack(fill='x', pady=5)
+        tk.Label(row1, text="Module Count:", font=('Consolas', 10), fg=C['text'],
+                 bg=C['panel'], width=14, anchor='w').pack(side='left')
+        self.module_var = tk.StringVar(value=str(Config.MODULE_NUM))
+        tk.Spinbox(row1, from_=1, to=16, textvariable=self.module_var, width=8,
+                   font=('Consolas', 10), bg=C['cell'], fg=C['text'],
+                   buttonbackground=C['cell']).pack(side='left', padx=5)
+
+        # CAN Bitrate
+        row2 = tk.Frame(form, bg=C['panel'])
+        row2.pack(fill='x', pady=5)
+        tk.Label(row2, text="CAN Bitrate:", font=('Consolas', 10), fg=C['text'],
+                 bg=C['panel'], width=14, anchor='w').pack(side='left')
+        self.bitrate_var = tk.StringVar(value=str(Config.CAN_BITRATE))
+        combo = ttk.Combobox(row2, textvariable=self.bitrate_var, width=10,
+                             values=['125000', '250000', '500000', '1000000'])
+        combo.pack(side='left', padx=5)
+
+        # Note
+        tk.Label(self.win, text="Note: Changes require reconnection",
+                 font=('Consolas', 8), fg=C['dim'], bg=C['panel']).pack(pady=10)
+
+        # Buttons
+        btn_frame = tk.Frame(self.win, bg=C['panel'])
+        btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text="Apply", font=('Consolas', 10, 'bold'),
+                  fg=C['bg'], bg=C['accent'], bd=0, width=10,
+                  command=self._apply).pack(side='left', padx=5)
+        tk.Button(btn_frame, text="Cancel", font=('Consolas', 10),
+                  fg=C['text'], bg=C['cell'], bd=0, width=10,
+                  command=self.win.destroy).pack(side='left', padx=5)
+
+    def _apply(self):
+        try:
+            new_modules = int(self.module_var.get())
+            new_bitrate = int(self.bitrate_var.get())
+
+            if new_modules < 1 or new_modules > 16:
+                raise ValueError("Module count must be 1-16")
+            if new_bitrate not in [125000, 250000, 500000, 1000000]:
+                raise ValueError("Invalid bitrate")
+
+            self.on_apply(new_modules, new_bitrate)
+            self.win.destroy()
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+
+# =============================================================================
+# Main GUI
+# =============================================================================
+class BMSMonitor:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.decoder = BMSDecoder()
+        self.can_src: Optional[CANSource] = None
+        self.demo: Optional[DemoGenerator] = None
+        self.view = 'overview'  # 'overview' or module_id (int)
+
+        self._setup_window()
+        self._create_header()
+        self._create_main()
+        self._create_status_bar()
+        self._update_loop()
+
     def _setup_window(self):
-        """Configure main window."""
-        self.root.title("BP17 BMS Monitor")
+        self.root.title("BP16B BMS")
         self.root.geometry("1400x900")
-        self.root.configure(bg=self.COLORS['bg_dark'])
+        self.root.configure(bg=C['bg'])
         self.root.minsize(1200, 700)
-        
-        # Configure grid weights
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(1, weight=1)
-    
-    def _create_widgets(self):
-        """Create all GUI widgets."""
-        self._create_header()
-        self._create_main_area()
-        self._create_status_bar()
-    
+
     def _create_header(self):
-        """Create header with connection controls."""
-        header = tk.Frame(self.root, bg=self.COLORS['bg_panel'], height=60)
-        header.grid(row=0, column=0, sticky='ew', padx=10, pady=(10, 5))
-        header.grid_propagate(False)
-        
+        hdr = tk.Frame(self.root, bg=C['header'], height=60)
+        hdr.grid(row=0, column=0, sticky='ew', padx=10, pady=(10, 5))
+        hdr.grid_propagate(False)
+
         # Title
-        title = tk.Label(
-            header,
-            text="⚡ BP17 BMS MONITOR",
-            font=('Consolas', 18, 'bold'),
-            fg=self.COLORS['accent'],
-            bg=self.COLORS['bg_panel']
-        )
-        title.pack(side='left', padx=20, pady=10)
-        
-        # Connection frame
-        conn_frame = tk.Frame(header, bg=self.COLORS['bg_panel'])
-        conn_frame.pack(side='right', padx=20, pady=10)
-        
-        # Port selection
-        tk.Label(
-            conn_frame,
-            text="PORT:",
-            font=('Consolas', 10),
-            fg=self.COLORS['text_dim'],
-            bg=self.COLORS['bg_panel']
-        ).pack(side='left', padx=(0, 5))
-        
-        self.port_var = tk.StringVar(value=self.serial_port or "")
-        self.port_combo = ttk.Combobox(
-            conn_frame,
-            textvariable=self.port_var,
-            width=15,
-            font=('Consolas', 10)
-        )
-        self.port_combo.pack(side='left', padx=5)
-        self._refresh_ports()
-        
-        # Refresh button
-        self.refresh_btn = tk.Button(
-            conn_frame,
-            text="⟳",
-            font=('Consolas', 12),
-            fg=self.COLORS['text'],
-            bg=self.COLORS['bg_cell'],
-            activebackground=self.COLORS['accent_dim'],
-            bd=0,
-            width=3,
-            command=self._refresh_ports
-        )
-        self.refresh_btn.pack(side='left', padx=5)
-        
-        # Connect button
-        self.connect_btn = tk.Button(
-            conn_frame,
-            text="CONNECT",
-            font=('Consolas', 10, 'bold'),
-            fg=self.COLORS['bg_dark'],
-            bg=self.COLORS['accent'],
-            activebackground=self.COLORS['accent_dim'],
-            bd=0,
-            width=10,
-            command=self._toggle_connection
-        )
-        self.connect_btn.pack(side='left', padx=10)
-        
-        # Demo button
-        self.demo_btn = tk.Button(
-            conn_frame,
-            text="DEMO",
-            font=('Consolas', 10),
-            fg=self.COLORS['text'],
-            bg=self.COLORS['bg_cell'],
-            activebackground=self.COLORS['warning'],
-            bd=0,
-            width=8,
-            command=self._toggle_demo
-        )
-        self.demo_btn.pack(side='left', padx=5)
-    
-    def _create_main_area(self):
-        """Create main monitoring area."""
-        main = tk.Frame(self.root, bg=self.COLORS['bg_dark'])
-        main.grid(row=1, column=0, sticky='nsew', padx=10, pady=5)
-        main.grid_columnconfigure(0, weight=3)
-        main.grid_columnconfigure(1, weight=1)
-        main.grid_rowconfigure(0, weight=1)
-        
-        # Left: Module grid
-        self._create_module_grid(main)
-        
-        # Right: Summary panel
-        self._create_summary_panel(main)
-    
-    def _create_module_grid(self, parent):
-        """Create grid of BMU module displays."""
-        grid_frame = tk.Frame(parent, bg=self.COLORS['bg_dark'])
-        grid_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 10))
-        
-        # Configure 2x4 grid
-        for i in range(2):
-            grid_frame.grid_columnconfigure(i, weight=1)
-        for i in range(4):
-            grid_frame.grid_rowconfigure(i, weight=1)
-        
-        self.module_frames = {}
-        self.cell_labels = {}
-        self.bitmap_canvases = {}
-        self.temp_labels = {}
-        self.voltage_labels = {}
-        
-        for idx, module_id in enumerate(range(1, 9)):
-            row = idx // 2
-            col = idx % 2
-            self._create_module_panel(grid_frame, module_id, row, col)
-    
-    def _create_module_panel(self, parent, module_id: int, row: int, col: int):
-        """Create a single BMU module panel."""
-        panel = tk.Frame(
-            parent,
-            bg=self.COLORS['bg_panel'],
-            highlightbackground=self.COLORS['border'],
-            highlightthickness=1
-        )
-        panel.grid(row=row, column=col, sticky='nsew', padx=5, pady=5)
-        self.module_frames[module_id] = panel
-        
+        tk.Label(hdr, text="BP16B BMS", font=('Consolas', 16, 'bold'),
+                 fg=C['accent'], bg=C['header']).pack(side='left', padx=20)
+
+        # Config button
+        tk.Button(hdr, text="\u2699", font=('Consolas', 14), fg=C['dim'],
+                  bg=C['header'], bd=0, cursor='hand2',
+                  command=self._show_config).pack(side='left', padx=5)
+
+        # AMS_OK indicator (center) - shows fault reason
+        self.ams_frame = tk.Frame(hdr, bg=C['ok'], highlightbackground=C['border'],
+                                  highlightthickness=2)
+        self.ams_frame.pack(side='left', expand=True)
+        self.ams_lbl = tk.Label(self.ams_frame, text="AMS", font=('Consolas', 9),
+                                fg=C['bg'], bg=C['ok'])
+        self.ams_lbl.pack(padx=10, pady=(3, 0))
+        self.ams_status = tk.Label(self.ams_frame, text="OK", font=('Consolas', 12, 'bold'),
+                                   fg=C['bg'], bg=C['ok'])
+        self.ams_status.pack(padx=10, pady=(0, 3))
+
+        # Controls
+        ctrl = tk.Frame(hdr, bg=C['header'])
+        ctrl.pack(side='right', padx=20)
+
+        tk.Label(ctrl, text="IF:", font=('Consolas', 9), fg=C['dim'],
+                 bg=C['header']).pack(side='left')
+        self.if_var = tk.StringVar(value='slcan')
+        ttk.Combobox(ctrl, textvariable=self.if_var,
+                     values=['slcan', 'pcan', 'socketcan', 'kvaser'],
+                     width=8, state='readonly').pack(side='left', padx=2)
+
+        tk.Label(ctrl, text="CH:", font=('Consolas', 9), fg=C['dim'],
+                 bg=C['header']).pack(side='left', padx=(5, 0))
+        self.ch_var = tk.StringVar(value='/dev/ttyACM0')
+        tk.Entry(ctrl, textvariable=self.ch_var, font=('Consolas', 9), width=15,
+                 bg=C['cell'], fg=C['text'], insertbackground=C['text']).pack(side='left', padx=2)
+
+        self.conn_btn = tk.Button(ctrl, text="CONNECT", font=('Consolas', 9, 'bold'),
+                                  fg=C['bg'], bg=C['accent'], bd=0, width=10,
+                                  command=self._toggle_connect)
+        self.conn_btn.pack(side='left', padx=5)
+
+        self.demo_btn = tk.Button(ctrl, text="DEMO", font=('Consolas', 9),
+                                  fg=C['text'], bg=C['cell'], bd=0, width=7,
+                                  command=self._toggle_demo)
+        self.demo_btn.pack(side='left', padx=2)
+
+    def _create_main(self):
+        self.main = tk.Frame(self.root, bg=C['bg'])
+        self.main.grid(row=1, column=0, sticky='nsew', padx=10, pady=5)
+        self.main.grid_columnconfigure(0, weight=3)
+        self.main.grid_columnconfigure(1, weight=1)
+        self.main.grid_rowconfigure(0, weight=1)
+
+        self._create_overview()
+        self._create_detail()
+        self._create_summary()
+        self._show_overview()
+
+    def _create_overview(self):
+        self.overview = tk.Frame(self.main, bg=C['bg'])
+        self.cards = {}
+        self._rebuild_overview()
+
+    def _rebuild_overview(self):
+        """Rebuild overview grid when module count changes"""
+        for widget in self.overview.winfo_children():
+            widget.destroy()
+        self.cards.clear()
+
+        # Configure grid
+        cols = 2
+        rows = (Config.MODULE_NUM + 1) // 2
+        for c in range(cols):
+            self.overview.grid_columnconfigure(c, weight=1)
+        for r in range(rows):
+            self.overview.grid_rowconfigure(r, weight=1)
+
+        # Create cards
+        for idx, mid in enumerate(range(1, Config.MODULE_NUM + 1)):
+            card = self._create_card(self.overview, mid)
+            card.grid(row=idx // 2, column=idx % 2, sticky='nsew', padx=4, pady=4)
+            self.cards[mid] = card
+
+    def _create_card(self, parent, mid):
+        card = tk.Frame(parent, bg=C['panel'], highlightbackground=C['border'],
+                        highlightthickness=1, cursor='hand2')
+        card.bind('<Button-1>', lambda e, m=mid: self._show_detail(m))
+        card._mid = mid
+        card._cells = []
+        card._temps = []
+
         # Header
-        header = tk.Frame(panel, bg=self.COLORS['bg_panel'])
-        header.pack(fill='x', padx=10, pady=(10, 5))
-        
-        tk.Label(
-            header,
-            text=f"BMU {module_id}",
-            font=('Consolas', 12, 'bold'),
-            fg=self.COLORS['accent'],
-            bg=self.COLORS['bg_panel']
-        ).pack(side='left')
-        
-        # Status indicator
-        self.voltage_labels[module_id] = tk.Label(
-            header,
-            text="-- V",
-            font=('Consolas', 11),
-            fg=self.COLORS['text'],
-            bg=self.COLORS['bg_panel']
-        )
-        self.voltage_labels[module_id].pack(side='right')
-        
-        # Cell voltages grid (2 rows x 5 cols)
-        cells_frame = tk.Frame(panel, bg=self.COLORS['bg_panel'])
-        cells_frame.pack(fill='x', padx=10, pady=5)
-        
-        self.cell_labels[module_id] = []
-        for i in range(10):
-            row_idx = i // 5
-            col_idx = i % 5
-            
-            cell_frame = tk.Frame(cells_frame, bg=self.COLORS['bg_cell'], width=55, height=40)
-            cell_frame.grid(row=row_idx, column=col_idx, padx=2, pady=2)
-            cell_frame.grid_propagate(False)
-            
-            tk.Label(
-                cell_frame,
-                text=f"C{i+1}",
-                font=('Consolas', 7),
-                fg=self.COLORS['text_dim'],
-                bg=self.COLORS['bg_cell']
-            ).pack(anchor='nw', padx=3, pady=(2, 0))
-            
-            voltage_lbl = tk.Label(
-                cell_frame,
-                text="-.--",
-                font=('Consolas', 10, 'bold'),
-                fg=self.COLORS['text'],
-                bg=self.COLORS['bg_cell']
-            )
-            voltage_lbl.pack(expand=True)
-            self.cell_labels[module_id].append(voltage_lbl)
-        
-        # Bitmap displays
-        bitmap_frame = tk.Frame(panel, bg=self.COLORS['bg_panel'])
-        bitmap_frame.pack(fill='x', padx=10, pady=5)
-        
-        self.bitmap_canvases[module_id] = {}
-        
-        # Balancing bitmap
-        bal_frame = tk.Frame(bitmap_frame, bg=self.COLORS['bg_panel'])
-        bal_frame.pack(side='left', padx=(0, 15))
-        
-        tk.Label(
-            bal_frame,
-            text="BAL",
-            font=('Consolas', 8),
-            fg=self.COLORS['text_dim'],
-            bg=self.COLORS['bg_panel']
-        ).pack(anchor='w')
-        
-        bal_canvas = tk.Canvas(
-            bal_frame,
-            width=100,
-            height=12,
-            bg=self.COLORS['bg_cell'],
-            highlightthickness=0
-        )
-        bal_canvas.pack()
-        self.bitmap_canvases[module_id]['balance'] = bal_canvas
-        
-        # Fault bitmap
-        fault_frame = tk.Frame(bitmap_frame, bg=self.COLORS['bg_panel'])
-        fault_frame.pack(side='left')
-        
-        tk.Label(
-            fault_frame,
-            text="FLT",
-            font=('Consolas', 8),
-            fg=self.COLORS['text_dim'],
-            bg=self.COLORS['bg_panel']
-        ).pack(anchor='w')
-        
-        fault_canvas = tk.Canvas(
-            fault_frame,
-            width=100,
-            height=12,
-            bg=self.COLORS['bg_cell'],
-            highlightthickness=0
-        )
-        fault_canvas.pack()
-        self.bitmap_canvases[module_id]['fault'] = fault_canvas
-        
-        # Temperature display
-        temp_frame = tk.Frame(panel, bg=self.COLORS['bg_panel'])
-        temp_frame.pack(fill='x', padx=10, pady=(5, 10))
-        
-        self.temp_labels[module_id] = []
-        for i in range(2):
-            tk.Label(
-                temp_frame,
-                text=f"T{i+1}:",
-                font=('Consolas', 9),
-                fg=self.COLORS['text_dim'],
-                bg=self.COLORS['bg_panel']
-            ).pack(side='left')
-            
-            temp_lbl = tk.Label(
-                temp_frame,
-                text="--.-V",
-                font=('Consolas', 9),
-                fg=self.COLORS['text'],
-                bg=self.COLORS['bg_panel']
-            )
-            temp_lbl.pack(side='left', padx=(0, 15))
-            self.temp_labels[module_id].append(temp_lbl)
-        
-        # Delta V
-        tk.Label(
-            temp_frame,
-            text="ΔV:",
-            font=('Consolas', 9),
-            fg=self.COLORS['text_dim'],
-            bg=self.COLORS['bg_panel']
-        ).pack(side='left')
-        
-        dv_lbl = tk.Label(
-            temp_frame,
-            text="--mV",
-            font=('Consolas', 9),
-            fg=self.COLORS['text'],
-            bg=self.COLORS['bg_panel']
-        )
-        dv_lbl.pack(side='left')
-        self.temp_labels[module_id].append(dv_lbl)  # Index 2 = delta V
-    
-    def _create_summary_panel(self, parent):
-        """Create summary panel on the right."""
-        summary = tk.Frame(parent, bg=self.COLORS['bg_panel'])
-        summary.grid(row=0, column=1, sticky='nsew')
-        
-        # Pack summary
-        tk.Label(
-            summary,
-            text="PACK SUMMARY",
-            font=('Consolas', 12, 'bold'),
-            fg=self.COLORS['accent'],
-            bg=self.COLORS['bg_panel']
-        ).pack(pady=(15, 10))
-        
-        # Summary stats
-        stats_frame = tk.Frame(summary, bg=self.COLORS['bg_panel'])
-        stats_frame.pack(fill='x', padx=15, pady=10)
-        
-        self.summary_labels = {}
-        
-        stats = [
-            ('total_v', 'Total Voltage', '--- V'),
-            ('min_cell', 'Min Cell', '-.-- V'),
-            ('max_cell', 'Max Cell', '-.-- V'),
-            ('delta_v', 'Pack ΔV', '--- mV'),
-            ('max_temp', 'Max Temp', '-.-- V'),
-            ('faults', 'Active Faults', '0'),
-        ]
-        
-        for key, label, default in stats:
-            row = tk.Frame(stats_frame, bg=self.COLORS['bg_panel'])
-            row.pack(fill='x', pady=3)
-            
-            tk.Label(
-                row,
-                text=label,
-                font=('Consolas', 10),
-                fg=self.COLORS['text_dim'],
-                bg=self.COLORS['bg_panel']
-            ).pack(side='left')
-            
-            val_label = tk.Label(
-                row,
-                text=default,
-                font=('Consolas', 11, 'bold'),
-                fg=self.COLORS['text'],
-                bg=self.COLORS['bg_panel']
-            )
-            val_label.pack(side='right')
-            self.summary_labels[key] = val_label
-        
-        # Separator
-        tk.Frame(summary, bg=self.COLORS['border'], height=1).pack(fill='x', padx=15, pady=15)
-        
-        # Message log
-        tk.Label(
-            summary,
-            text="CAN LOG",
-            font=('Consolas', 10, 'bold'),
-            fg=self.COLORS['text_dim'],
-            bg=self.COLORS['bg_panel']
-        ).pack(pady=(0, 5))
-        
-        log_frame = tk.Frame(summary, bg=self.COLORS['bg_cell'])
-        log_frame.pack(fill='both', expand=True, padx=15, pady=(0, 15))
-        
-        self.log_text = tk.Text(
-            log_frame,
-            font=('Consolas', 8),
-            fg=self.COLORS['text'],
-            bg=self.COLORS['bg_cell'],
-            height=15,
-            width=30,
-            state='disabled',
-            wrap='none'
-        )
-        self.log_text.pack(fill='both', expand=True, padx=2, pady=2)
-    
+        hdr = tk.Frame(card, bg=C['panel'])
+        hdr.pack(fill='x', padx=8, pady=(6, 3))
+        card._title = tk.Label(hdr, text=f"BMU {mid}", font=('Consolas', 11, 'bold'),
+                               fg=C['accent'], bg=C['panel'])
+        card._title.pack(side='left')
+        card._volt = tk.Label(hdr, text="--V", font=('Consolas', 10),
+                              fg=C['text'], bg=C['panel'])
+        card._volt.pack(side='right')
+
+        # Cells 2x5
+        cells_frame = tk.Frame(card, bg=C['panel'])
+        cells_frame.pack(fill='x', padx=6, pady=2)
+        for i in range(Config.CELL_NUM):
+            cf = tk.Frame(cells_frame, bg=C['cell'], width=52, height=36)
+            cf.grid(row=i // 5, column=i % 5, padx=1, pady=1)
+            cf.grid_propagate(False)
+            tk.Label(cf, text=f"C{i + 1}", font=('Consolas', 6), fg=C['dim'],
+                     bg=C['cell']).pack(anchor='nw', padx=2)
+            lbl = tk.Label(cf, text="-.--", font=('Consolas', 9, 'bold'),
+                           fg=C['text'], bg=C['cell'])
+            lbl.pack(expand=True)
+            card._cells.append(lbl)
+
+        # Info row
+        info = tk.Frame(card, bg=C['panel'])
+        info.pack(fill='x', padx=8, pady=(2, 6))
+        for t in range(2):
+            tk.Label(info, text=f"T{t + 1}:", font=('Consolas', 8), fg=C['dim'],
+                     bg=C['panel']).pack(side='left')
+            tl = tk.Label(info, text="--C", font=('Consolas', 8), fg=C['text'],
+                          bg=C['panel'])
+            tl.pack(side='left', padx=(0, 8))
+            card._temps.append(tl)
+        tk.Label(info, text="dV:", font=('Consolas', 8), fg=C['dim'],
+                 bg=C['panel']).pack(side='left')
+        card._dv = tk.Label(info, text="--mV", font=('Consolas', 8),
+                            fg=C['text'], bg=C['panel'])
+        card._dv.pack(side='left')
+        card._bal = tk.Label(info, text="", font=('Consolas', 8),
+                             fg=C['bal'], bg=C['panel'])
+        card._bal.pack(side='right')
+
+        # Bind clicks on all children
+        for w in card.winfo_children():
+            w.bind('<Button-1>', lambda e, m=mid: self._show_detail(m))
+            for c in w.winfo_children():
+                c.bind('<Button-1>', lambda e, m=mid: self._show_detail(m))
+
+        return card
+
+    def _create_detail(self):
+        self.detail = tk.Frame(self.main, bg=C['bg'])
+
+        # Header
+        dhdr = tk.Frame(self.detail, bg=C['header'], height=45)
+        dhdr.pack(fill='x', pady=(0, 5))
+        dhdr.pack_propagate(False)
+        tk.Button(dhdr, text="< Back", font=('Consolas', 9), fg=C['text'],
+                  bg=C['cell'], bd=0, command=self._show_overview).pack(side='left', padx=10, pady=8)
+        self.det_title = tk.Label(dhdr, text="BMU --", font=('Consolas', 12, 'bold'),
+                                  fg=C['accent'], bg=C['header'])
+        self.det_title.pack(side='left', padx=15)
+        self.det_conn = tk.Label(dhdr, text="", font=('Consolas', 9),
+                                 fg=C['ok'], bg=C['header'])
+        self.det_conn.pack(side='right', padx=15)
+
+        content = tk.Frame(self.detail, bg=C['bg'])
+        content.pack(fill='both', expand=True)
+
+        # Left: Cells + Status
+        left = tk.Frame(content, bg=C['panel'])
+        left.pack(side='left', fill='both', expand=True, padx=(0, 5))
+
+        tk.Label(left, text="Cell Voltages", font=('Consolas', 10, 'bold'),
+                 fg=C['accent'], bg=C['panel']).pack(anchor='w', padx=10, pady=(10, 5))
+        cg = tk.Frame(left, bg=C['panel'])
+        cg.pack(fill='x', padx=10)
+        self.det_cells = []
+        for i in range(Config.CELL_NUM):
+            cf = tk.Frame(cg, bg=C['cell'], width=65, height=45)
+            cf.grid(row=i // 5, column=i % 5, padx=2, pady=2)
+            cf.grid_propagate(False)
+            tk.Label(cf, text=f"Cell {i + 1}", font=('Consolas', 7), fg=C['dim'],
+                     bg=C['cell']).pack(anchor='nw', padx=3)
+            lbl = tk.Label(cf, text="-.---V", font=('Consolas', 10, 'bold'),
+                           fg=C['text'], bg=C['cell'])
+            lbl.pack(expand=True)
+            self.det_cells.append(lbl)
+
+        tk.Label(left, text="Status", font=('Consolas', 10, 'bold'),
+                 fg=C['accent'], bg=C['panel']).pack(anchor='w', padx=10, pady=(15, 5))
+        sf = tk.Frame(left, bg=C['panel'])
+        sf.pack(fill='x', padx=10)
+        self.det_temps = []
+        for t in range(2):
+            tk.Label(sf, text=f"Temp {t + 1}:", font=('Consolas', 9), fg=C['dim'],
+                     bg=C['panel']).pack(side='left')
+            tl = tk.Label(sf, text="--C", font=('Consolas', 9, 'bold'),
+                          fg=C['text'], bg=C['panel'])
+            tl.pack(side='left', padx=(3, 15))
+            self.det_temps.append(tl)
+        tk.Label(sf, text="dV:", font=('Consolas', 9), fg=C['dim'],
+                 bg=C['panel']).pack(side='left')
+        self.det_dv = tk.Label(sf, text="--mV", font=('Consolas', 9, 'bold'),
+                               fg=C['text'], bg=C['panel'])
+        self.det_dv.pack(side='left', padx=3)
+        self.det_bal = tk.Label(sf, text="", font=('Consolas', 9),
+                                fg=C['bal'], bg=C['panel'])
+        self.det_bal.pack(side='right', padx=10)
+
+        # Right: Fault table
+        right = tk.Frame(content, bg=C['panel'])
+        right.pack(side='right', fill='both', expand=True, padx=(5, 0))
+
+        tk.Label(right, text="Fault Status", font=('Consolas', 10, 'bold'),
+                 fg=C['accent'], bg=C['panel']).pack(anchor='w', padx=10, pady=(10, 5))
+        tbl = tk.Frame(right, bg=C['panel'])
+        tbl.pack(fill='x', padx=10)
+
+        # Header row
+        hr = tk.Frame(tbl, bg=C['cell'])
+        hr.pack(fill='x', pady=(0, 2))
+        tk.Label(hr, text="Fault", font=('Consolas', 8), fg=C['dim'],
+                 bg=C['cell'], width=8, anchor='w').pack(side='left', padx=2)
+        for i in range(Config.CELL_NUM):
+            tk.Label(hr, text=f"C{i + 1}", font=('Consolas', 8), fg=C['dim'],
+                     bg=C['cell'], width=3).pack(side='left', padx=1)
+
+        self.fault_cells = {}
+        for attr, name, is_crit in FAULT_TYPES:
+            row = tk.Frame(tbl, bg=C['panel'])
+            row.pack(fill='x', pady=1)
+            tk.Label(row, text=name, font=('Consolas', 8), fg=C['text'],
+                     bg=C['cell'], width=8, anchor='w').pack(side='left', padx=2)
+            for ci in range(Config.CELL_NUM):
+                lbl = tk.Label(row, text="\u2014", font=('Consolas', 9),
+                               fg=C['dim'], bg=C['cell'], width=3)
+                lbl.pack(side='left', padx=1)
+                self.fault_cells[(attr, ci)] = lbl
+
+        # Legend
+        leg = tk.Frame(right, bg=C['panel'])
+        leg.pack(anchor='w', padx=10, pady=10)
+        for sym, col, txt in [("\u2713", C['ok'], "OK"), ("\u26A0", C['warn'], "Warn"),
+                              ("\u2717", C['crit'], "Crit")]:
+            tk.Label(leg, text=f"{sym} {txt}", font=('Consolas', 8),
+                     fg=col, bg=C['panel']).pack(side='left', padx=8)
+
+    def _create_summary(self):
+        self.summary = tk.Frame(self.main, bg=C['panel'])
+        tk.Label(self.summary, text="PACK SUMMARY", font=('Consolas', 11, 'bold'),
+                 fg=C['accent'], bg=C['panel']).pack(pady=(12, 8))
+
+        sf = tk.Frame(self.summary, bg=C['panel'])
+        sf.pack(fill='x', padx=12)
+        self.sum_lbl = {}
+        for key, name, dflt in [('total', 'Total Voltage', '--- V'),
+                                ('min', 'Min Cell', '-.-- V'),
+                                ('max', 'Max Cell', '-.-- V'),
+                                ('dv', 'Pack dV', '--- mV'),
+                                ('temp', 'Max Temp', '--C'),
+                                ('conn', 'Connected', '0/8'),
+                                ('fault', 'Faults', '0')]:
+            r = tk.Frame(sf, bg=C['panel'])
+            r.pack(fill='x', pady=2)
+            tk.Label(r, text=name, font=('Consolas', 9), fg=C['dim'],
+                     bg=C['panel']).pack(side='left')
+            l = tk.Label(r, text=dflt, font=('Consolas', 10, 'bold'),
+                         fg=C['text'], bg=C['panel'])
+            l.pack(side='right')
+            self.sum_lbl[key] = l
+
+        tk.Frame(self.summary, bg=C['border'], height=1).pack(fill='x', padx=12, pady=12)
+
+        # Module status grid
+        tk.Label(self.summary, text="MODULE STATUS", font=('Consolas', 9),
+                 fg=C['dim'], bg=C['panel']).pack()
+        self.mod_grid_frame = tk.Frame(self.summary, bg=C['panel'])
+        self.mod_grid_frame.pack(pady=8)
+        self.mod_ind = {}
+        self._rebuild_module_grid()
+
+    def _rebuild_module_grid(self):
+        """Rebuild module status grid when count changes"""
+        for widget in self.mod_grid_frame.winfo_children():
+            widget.destroy()
+        self.mod_ind.clear()
+
+        for i in range(Config.MODULE_NUM):
+            l = tk.Label(self.mod_grid_frame, text=f"\u25CBM{i + 1}",
+                         font=('Consolas', 8), fg=C['dim'], bg=C['cell'], width=5)
+            l.grid(row=i // 4, column=i % 4, padx=2, pady=2)
+            self.mod_ind[i + 1] = l
+
+    def _show_overview(self):
+        self.detail.grid_forget()
+        self.overview.grid(row=0, column=0, sticky='nsew')
+        self.summary.grid(row=0, column=1, sticky='nsew')
+        self.view = 'overview'
+
+    def _show_detail(self, mid):
+        if mid not in self.decoder.modules:
+            return
+        self.overview.grid_forget()
+        self.summary.grid_forget()
+        self.detail.grid(row=0, column=0, columnspan=2, sticky='nsew')
+        self.det_title.configure(text=f"BMU {mid}")
+        self.view = mid
+
+    def _show_config(self):
+        ConfigDialog(self.root, self._apply_config)
+
+    def _apply_config(self, module_count: int, bitrate: int):
+        """Apply configuration changes"""
+        # Disconnect if connected
+        if self.can_src and self.can_src.running:
+            self._toggle_connect()
+        if self.demo and self.demo.running:
+            self._toggle_demo()
+
+        # Update config
+        Config.MODULE_NUM = module_count
+        Config.CAN_BITRATE = bitrate
+
+        # Rebuild decoder and UI
+        self.decoder.set_module_count(module_count)
+        self._rebuild_overview()
+        self._rebuild_module_grid()
+        self._show_overview()
+
+        self.status_lbl.configure(
+            text=f"Config: {module_count} modules, {bitrate // 1000}k bitrate",
+            fg=C['accent'])
+
     def _create_status_bar(self):
-        """Create status bar at bottom."""
-        status = tk.Frame(self.root, bg=self.COLORS['bg_panel'], height=30)
-        status.grid(row=2, column=0, sticky='ew', padx=10, pady=(5, 10))
-        status.grid_propagate(False)
-        
-        self.status_label = tk.Label(
-            status,
-            text="Disconnected",
-            font=('Consolas', 9),
-            fg=self.COLORS['text_dim'],
-            bg=self.COLORS['bg_panel']
-        )
-        self.status_label.pack(side='left', padx=10, pady=5)
-        
-        self.rx_label = tk.Label(
-            status,
-            text="RX: 0",
-            font=('Consolas', 9),
-            fg=self.COLORS['text_dim'],
-            bg=self.COLORS['bg_panel']
-        )
-        self.rx_label.pack(side='right', padx=10, pady=5)
-    
-    def _refresh_ports(self):
-        """Refresh available serial ports."""
-        if SERIAL_AVAILABLE:
-            ports = [p.device for p in serial.tools.list_ports.comports()]
+        sb = tk.Frame(self.root, bg=C['panel'], height=28)
+        sb.grid(row=2, column=0, sticky='ew', padx=10, pady=(5, 10))
+        sb.grid_propagate(False)
+        self.status_lbl = tk.Label(sb, text="Disconnected", font=('Consolas', 9),
+                                   fg=C['dim'], bg=C['panel'])
+        self.status_lbl.pack(side='left', padx=10, pady=4)
+        self.rx_lbl = tk.Label(sb, text="RX: 0", font=('Consolas', 9),
+                               fg=C['dim'], bg=C['panel'])
+        self.rx_lbl.pack(side='right', padx=10, pady=4)
+
+    def _toggle_connect(self):
+        if self.can_src and self.can_src.running:
+            self.can_src.disconnect()
+            self.can_src = None
+            self.decoder.reset()
+            self.conn_btn.configure(text="CONNECT", bg=C['accent'], fg=C['bg'])
+            self.status_lbl.configure(text="Disconnected", fg=C['dim'])
         else:
-            ports = ['/dev/ttyUSB0', '/dev/ttyACM0', 'COM3']  # Dummy for demo
-        
-        self.port_combo['values'] = ports
-        if ports and not self.port_var.get():
-            self.port_var.set(ports[0])
-    
-    def _toggle_connection(self):
-        """Connect or disconnect serial."""
-        if self.running:
-            self._disconnect()
-        else:
-            self._connect()
-    
-    def _connect(self):
-        """Establish serial connection."""
-        if not SERIAL_AVAILABLE:
-            messagebox.showwarning("Warning", "pyserial not installed. Use DEMO mode.")
-            return
-        
-        port = self.port_var.get()
-        if not port:
-            messagebox.showerror("Error", "Select a serial port")
-            return
-        
-        try:
-            self.serial_conn = serial.Serial(port, 115200, timeout=0.1)
-            self.running = True
-            self.connect_btn.configure(text="DISCONNECT", bg=self.COLORS['critical'])
-            self.status_label.configure(text=f"Connected: {port}", fg=self.COLORS['accent'])
-            
-            # Start read thread
-            self.read_thread = threading.Thread(target=self._serial_read_loop, daemon=True)
-            self.read_thread.start()
-            
-        except serial.SerialException as e:
-            messagebox.showerror("Connection Error", str(e))
-    
-    def _disconnect(self):
-        """Close serial connection."""
-        self.running = False
-        if self.serial_conn:
-            self.serial_conn.close()
-            self.serial_conn = None
-        
-        self.connect_btn.configure(text="CONNECT", bg=self.COLORS['accent'])
-        self.status_label.configure(text="Disconnected", fg=self.COLORS['text_dim'])
-    
-    def _toggle_demo(self):
-        """Toggle demo mode."""
-        if self.demo_mode:
-            self._stop_demo()
-        else:
-            self._start_demo()
-    
-    def _start_demo(self):
-        """Start demo data generation."""
-        if self.running:
-            self._disconnect()
-        
-        self.demo_mode = True
-        self.demo_generator = DemoDataGenerator(self.decoder)
-        self.demo_generator.start()
-        
-        self.demo_btn.configure(text="STOP DEMO", bg=self.COLORS['warning'])
-        self.status_label.configure(text="Demo Mode", fg=self.COLORS['warning'])
-    
-    def _stop_demo(self):
-        """Stop demo data generation."""
-        self.demo_mode = False
-        if self.demo_generator:
-            self.demo_generator.stop()
-            self.demo_generator = None
-        
-        self.demo_btn.configure(text="DEMO", bg=self.COLORS['bg_cell'])
-        self.status_label.configure(text="Disconnected", fg=self.COLORS['text_dim'])
-    
-    def _serial_read_loop(self):
-        """Background thread for reading serial data."""
-        rx_count = 0
-        
-        while self.running and self.serial_conn:
-            try:
-                data = self.serial_conn.read(256)
-                if data:
-                    frames = self.parser.feed(data)
-                    for can_id, payload in frames:
-                        self.decoder.decode_frame(can_id, payload)
-                        rx_count += 1
-                        
-                        # Log message
-                        log_msg = f"{can_id:08X}#{payload.hex().upper()}"
-                        self.message_log.append(log_msg)
-                    
-                    # Update RX counter in main thread
-                    self.root.after(0, lambda c=rx_count: self.rx_label.configure(text=f"RX: {c}"))
-            
-            except serial.SerialException:
-                break
-    
-    def _start_update_loop(self):
-        """Start GUI update loop."""
-        self._update_display()
-        self.root.after(100, self._start_update_loop)  # 10 Hz refresh
-    
-    def _update_display(self):
-        """Update all display elements."""
-        all_voltages = []
-        all_temps = []
-        fault_count = 0
-        
-        for module_id, bmu in self.decoder.modules.items():
-            # Update cell voltages
-            for i, voltage in enumerate(bmu.cell_voltages):
-                label = self.cell_labels[module_id][i]
-                
-                if voltage > 0:
-                    label.configure(text=f"{voltage:.2f}")
-                    all_voltages.append(voltage)
-                    
-                    # Color based on voltage level
-                    if voltage >= 4.15:
-                        label.configure(fg=self.COLORS['cell_high'])
-                    elif voltage <= 3.3:
-                        label.configure(fg=self.COLORS['cell_low'])
-                    else:
-                        label.configure(fg=self.COLORS['cell_ok'])
-                else:
-                    label.configure(text="-.--", fg=self.COLORS['text_dim'])
-            
-            # Update module total voltage
-            total_v = bmu.get_total_voltage()
-            if total_v > 0:
-                self.voltage_labels[module_id].configure(text=f"{total_v:.1f}V")
-            
-            # Update temperatures
-            if bmu.temp_sensor_1 > 0:
-                self.temp_labels[module_id][0].configure(text=f"{bmu.temp_sensor_1:.2f}V")
-                all_temps.append(bmu.temp_sensor_1)
-            if bmu.temp_sensor_2 > 0:
-                self.temp_labels[module_id][1].configure(text=f"{bmu.temp_sensor_2:.2f}V")
-                all_temps.append(bmu.temp_sensor_2)
-            
-            # Update delta V
-            if bmu.delta_v > 0:
-                dv_mv = bmu.delta_v * 1000
-                self.temp_labels[module_id][2].configure(text=f"{dv_mv:.0f}mV")
-            
-            # Update balancing bitmap
-            self._draw_bitmap(
-                self.bitmap_canvases[module_id]['balance'],
-                bmu.balancing_cells,
-                self.COLORS['balance_on']
-            )
-            
-            # Update fault bitmap (combine all faults)
-            combined_faults = (
-                bmu.ov_warning | bmu.ov_critical |
-                bmu.lv_warning | bmu.lv_critical |
-                bmu.ot_warning | bmu.ot_critical |
-                bmu.odv_warning | bmu.odv_critical
-            )
-            self._draw_bitmap(
-                self.bitmap_canvases[module_id]['fault'],
-                combined_faults,
-                self.COLORS['critical'] if bmu.has_critical_fault() else self.COLORS['warning']
-            )
-            
-            if bmu.has_any_fault():
-                fault_count += 1
-            
-            # Update panel border based on status
-            panel = self.module_frames[module_id]
-            if bmu.has_critical_fault():
-                panel.configure(highlightbackground=self.COLORS['critical'])
-            elif bmu.has_any_fault():
-                panel.configure(highlightbackground=self.COLORS['warning'])
-            elif time.time() - bmu.last_update < 2.0:
-                panel.configure(highlightbackground=self.COLORS['accent'])
+            if self.demo and self.demo.running:
+                self._toggle_demo()
+            self.can_src = CANSource(self.decoder)
+            if self.can_src.connect(self.if_var.get(), self.ch_var.get(), Config.CAN_BITRATE):
+                self.conn_btn.configure(text="DISCONNECT", bg=C['crit'], fg=C['text'])
+                self.status_lbl.configure(
+                    text=f"CAN: {self.if_var.get()}:{self.ch_var.get()} @ {Config.CAN_BITRATE // 1000}k",
+                    fg=C['accent'])
             else:
-                panel.configure(highlightbackground=self.COLORS['border'])
-        
-        # Update summary
-        if all_voltages:
-            self.summary_labels['total_v'].configure(text=f"{sum(all_voltages):.1f} V")
-            self.summary_labels['min_cell'].configure(text=f"{min(all_voltages):.2f} V")
-            self.summary_labels['max_cell'].configure(text=f"{max(all_voltages):.2f} V")
-            delta = (max(all_voltages) - min(all_voltages)) * 1000
-            self.summary_labels['delta_v'].configure(text=f"{delta:.0f} mV")
-        
-        if all_temps:
-            self.summary_labels['max_temp'].configure(text=f"{max(all_temps):.2f} V")
-        
-        self.summary_labels['faults'].configure(
-            text=str(fault_count),
-            fg=self.COLORS['critical'] if fault_count > 0 else self.COLORS['accent']
-        )
-        
-        # Update log
-        self._update_log()
-    
-    def _draw_bitmap(self, canvas: tk.Canvas, value: int, color: str):
-        """Draw a 10-bit bitmap on canvas."""
-        canvas.delete('all')
-        
-        cell_width = 9
-        cell_height = 10
-        padding = 1
-        
-        for i in range(10):
-            x = i * (cell_width + padding) + 2
-            y = 1
-            
-            bit_set = bool(value & (1 << (9 - i)))  # MSB first
-            fill = color if bit_set else self.COLORS['bg_dark']
-            
-            canvas.create_rectangle(
-                x, y, x + cell_width, y + cell_height,
-                fill=fill,
-                outline=self.COLORS['border']
-            )
-    
-    def _update_log(self):
-        """Update CAN message log."""
-        if not self.message_log:
+                messagebox.showerror("Error", f"CAN connection failed: {self.can_src.error_msg}")
+                self.can_src = None
+
+    def _toggle_demo(self):
+        if self.demo and self.demo.running:
+            self.demo.stop()
+            self.demo = None
+            self.decoder.reset()
+            self.demo_btn.configure(text="DEMO", bg=C['cell'], fg=C['text'])
+            self.status_lbl.configure(text="Disconnected", fg=C['dim'])
+        else:
+            if self.can_src and self.can_src.running:
+                self._toggle_connect()
+            self.demo = DemoGenerator(self.decoder)
+            self.demo.start()
+            self.demo_btn.configure(text="STOP", bg=C['warn'], fg=C['bg'])
+            self.status_lbl.configure(text="Demo Mode", fg=C['warn'])
+
+    def _update_loop(self):
+        # Aggregate and evaluate AMS status
+        self.decoder.aggregate()
+        self._update_ams_ok()
+        self._update_rx()
+
+        if self.view == 'overview':
+            self._update_overview()
+            self._update_summary()
+        else:
+            self._update_detail_view(self.view)
+
+        self.root.after(100, self._update_loop)
+
+    def _update_ams_ok(self):
+        """Update AMS_OK indicator with fault reason"""
+        ok = self.decoder.ams_ok
+        reason = self.decoder.fault_reason
+
+        col = C['ok'] if ok else C['crit']
+        txt = reason.value
+
+        self.ams_frame.configure(bg=col)
+        self.ams_lbl.configure(bg=col)
+        self.ams_status.configure(text=txt, bg=col)
+
+    def _update_rx(self):
+        rx = self.can_src.rx_count if self.can_src else 0
+        self.rx_lbl.configure(text=f"RX: {rx}")
+
+    def _update_overview(self):
+        for mid, card in self.cards.items():
+            if mid not in self.decoder.modules:
+                continue
+            bmu = self.decoder.modules[mid]
+            conn = bmu.is_connected()
+
+            if conn:
+                card.configure(bg=C['panel'])
+                card._title.configure(fg=C['accent'], bg=C['panel'])
+                card._volt.configure(text=f"{bmu.total_v():.1f}V", fg=C['text'], bg=C['panel'])
+
+                for i, v in enumerate(bmu.cell_voltages):
+                    if i < len(card._cells):
+                        fg = (C['crit'] if v >= Config.CELL_V_HIGH else
+                              C['warn'] if v <= Config.CELL_V_LOW else C['ok'])
+                        card._cells[i].configure(text=f"{v:.2f}", fg=fg, bg=C['cell'])
+
+                for t, temp in enumerate(bmu.temps):
+                    if t < len(card._temps):
+                        card._temps[t].configure(text=f"{temp:.0f}C")
+
+                card._dv.configure(text=f"{bmu.delta_v * 1000:.0f}mV")
+                card._bal.configure(text="\u26A1BAL" if bmu.balancing_cells else "")
+
+                border = (C['crit'] if bmu.has_critical() else
+                          C['warn'] if bmu.has_fault() else C['accent'])
+                card.configure(highlightbackground=border)
+            else:
+                card.configure(bg=C['disconn'], highlightbackground=C['disconn'])
+                card._title.configure(fg=C['disconn'], bg=C['disconn'])
+                card._volt.configure(text="OFFLINE", fg=C['disconn'], bg=C['disconn'])
+                for cl in card._cells:
+                    cl.configure(text="--", fg=C['disconn'], bg=C['disconn'])
+
+    def _update_summary(self):
+        d = self.decoder
+
+        self.sum_lbl['total'].configure(
+            text=f"{d.accum_voltage:.1f} V" if d.accum_voltage > 0 else "--- V")
+        self.sum_lbl['min'].configure(
+            text=f"{d.min_cell_v:.2f} V" if d.min_cell_v > 0 else "-.-- V")
+        self.sum_lbl['max'].configure(
+            text=f"{d.max_cell_v:.2f} V" if d.max_cell_v > 0 else "-.-- V")
+        self.sum_lbl['dv'].configure(
+            text=f"{d.pack_delta_v * 1000:.0f} mV" if d.pack_delta_v > 0 else "--- mV")
+        self.sum_lbl['temp'].configure(
+            text=f"{d.max_temp:.0f}C" if d.max_temp > 0 else "--C")
+        self.sum_lbl['conn'].configure(text=f"{d.connected_count}/{Config.MODULE_NUM}")
+        self.sum_lbl['fault'].configure(
+            text=str(d.fault_count),
+            fg=C['crit'] if d.fault_count > 0 else C['ok'])
+
+        # Update module indicators
+        for mid, bmu in self.decoder.modules.items():
+            if mid not in self.mod_ind:
+                continue
+            if bmu.is_connected():
+                sym = "\u2717" if bmu.has_critical() else "\u26A0" if bmu.has_fault() else "\u25CF"
+                col = C['crit'] if bmu.has_critical() else C['warn'] if bmu.has_fault() else C['ok']
+            else:
+                sym, col = "\u25CB", C['disconn']
+            self.mod_ind[mid].configure(text=f"{sym}M{mid}", fg=col)
+
+    def _update_detail_view(self, mid):
+        if mid not in self.decoder.modules:
             return
-        
-        self.log_text.configure(state='normal')
-        self.log_text.delete('1.0', tk.END)
-        
-        for msg in list(self.message_log)[-20:]:  # Show last 20
-            self.log_text.insert(tk.END, msg + '\n')
-        
-        self.log_text.see(tk.END)
-        self.log_text.configure(state='disabled')
-    
+
+        bmu = self.decoder.modules[mid]
+        conn = bmu.is_connected()
+
+        self.det_conn.configure(
+            text="\u25CF Connected" if conn else "\u25CB Offline",
+            fg=C['ok'] if conn else C['disconn'])
+
+        if conn:
+            for i, v in enumerate(bmu.cell_voltages):
+                if i < len(self.det_cells):
+                    fg = (C['crit'] if v >= Config.CELL_V_HIGH else
+                          C['warn'] if v <= Config.CELL_V_LOW else C['ok'])
+                    self.det_cells[i].configure(text=f"{v:.3f}V", fg=fg)
+
+            for t, temp in enumerate(bmu.temps):
+                if t < len(self.det_temps):
+                    self.det_temps[t].configure(text=f"{temp:.1f}C")
+
+            self.det_dv.configure(text=f"{bmu.delta_v * 1000:.0f}mV")
+
+            bal_list = [str(i + 1) for i in range(Config.CELL_NUM)
+                        if bmu.balancing_cells & (1 << (9 - i))]
+            self.det_bal.configure(text=f"\u26A1 {','.join(bal_list)}" if bal_list else "")
+
+            for attr, name, is_crit in FAULT_TYPES:
+                for ci in range(Config.CELL_NUM):
+                    key = (attr, ci)
+                    if key not in self.fault_cells:
+                        continue
+                    has = bmu.cell_fault(attr, ci)
+                    sym = "\u2717" if has and is_crit else "\u26A0" if has else "\u2713"
+                    col = C['crit'] if has and is_crit else C['warn'] if has else C['ok']
+                    self.fault_cells[key].configure(text=sym, fg=col)
+        else:
+            for cl in self.det_cells:
+                cl.configure(text="-.---V", fg=C['disconn'])
+            for tl in self.det_temps:
+                tl.configure(text="--C", fg=C['disconn'])
+            self.det_dv.configure(text="--mV")
+            self.det_bal.configure(text="")
+            for k in self.fault_cells:
+                self.fault_cells[k].configure(text="\u2014", fg=C['dim'])
+
     def on_closing(self):
-        """Clean up on window close."""
-        self._disconnect()
-        self._stop_demo()
+        if self.can_src:
+            self.can_src.disconnect()
+        if self.demo:
+            self.demo.stop()
         self.root.destroy()
 
-
 # =============================================================================
-# Main Entry Point
+# Main
 # =============================================================================
-
 def main():
-    parser = argparse.ArgumentParser(description='BP17 BMS CAN Monitor')
-    parser.add_argument('--port', '-p', type=str, help='Serial port (e.g., /dev/ttyUSB0)')
-    parser.add_argument('--baud', '-b', type=int, default=115200, help='Baud rate')
+    parser = argparse.ArgumentParser(description='BP16B BMS CAN Monitor')
     parser.add_argument('--demo', '-d', action='store_true', help='Start in demo mode')
+    parser.add_argument('--can', '-c', type=str,
+                        help='CAN interface: slcan, pcan, socketcan, kvaser')
+    parser.add_argument('--channel', type=str,
+                        help='CAN channel: /dev/ttyACM0, PCAN_USBBUS1, can0')
+    parser.add_argument('--bitrate', type=int, default=Config.CAN_BITRATE,
+                        help=f'CAN bitrate (default: {Config.CAN_BITRATE})')
+    parser.add_argument('--modules', type=int, default=Config.MODULE_NUM,
+                        help=f'Number of BMU modules (default: {Config.MODULE_NUM})')
     args = parser.parse_args()
-    
-    # Create data structures
-    decoder = BMSDecoder(num_modules=8)
-    
-    # Create GUI
-    root = tk.Tk()
-    app = BMSMonitorGUI(root, decoder, serial_port=args.port)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    
-    # Auto-start demo if requested
-    if args.demo:
-        root.after(500, app._start_demo)
-    
-    root.mainloop()
 
+    # Apply command line config
+    if args.bitrate:
+        Config.CAN_BITRATE = args.bitrate
+    if args.modules:
+        Config.MODULE_NUM = args.modules
+
+    root = tk.Tk()
+    app = BMSMonitor(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+
+    if args.demo:
+        root.after(500, app._toggle_demo)
+    elif args.can and args.channel:
+        app.if_var.set(args.can)
+        app.ch_var.set(args.channel)
+        root.after(500, app._toggle_connect)
+
+    root.mainloop()
 
 if __name__ == '__main__':
     main()

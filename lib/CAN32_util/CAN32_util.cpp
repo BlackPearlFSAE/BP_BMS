@@ -14,7 +14,7 @@ bool CAN32_initCANBus(int can_tx,int can_rx,
   twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)can_tx,(gpio_num_t)can_rx,TWAI_MODE_NORMAL);
   twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
   g_config.rx_queue_len = 32;
-  g_config.tx_queue_len = 6;
+  g_config.tx_queue_len = 32;
   // Install TWAI driver
   if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
     Serial.println(" Driver installed");
@@ -78,7 +78,7 @@ int CAN32_receiveCAN(twai_message_t* rx_msg, bool canbusready) {
   int canReceive_status = twai_receive(rx_msg, pdMS_TO_TICKS(pdmslimit));
   // Serial.printf("Received - ID: 0x%X, DLC: %d, Data: ", rx_msg->identifier, rx_msg->data_length_code);
   return canReceive_status;
-  // Error Handling will be for user
+  // Error Handling will be or user
 }
 
 void CAN32_twai_debug(uint32_t alerts_trigger){
