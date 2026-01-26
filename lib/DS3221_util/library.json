@@ -1,0 +1,20 @@
+{
+  "name": "DS3221_helper",
+  "version": "1.0.0",
+  "description": "DS3231 RTC utility library for BMS - provides centralized time management",
+  "keywords": ["RTC", "DS3231", "time", "synchronization"],
+  "authors": [
+    {
+      "name": "FSAE BMS Team"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"],
+  "dependencies": {
+    "RTClib": "*"
+  }
+}
