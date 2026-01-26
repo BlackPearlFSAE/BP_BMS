@@ -160,8 +160,11 @@ void loop() {
   readAllCells();
   if(SESSION_TIME - debug_timer >= 200){
     Serial.print("Vcell[10]: ");
-    for(int i = 0 ; i < CELL_NUM ; i ++)
+    for(int i = 0 ; i < CELL_NUM ; i ++){
       Serial.printf("%.2f, ",myBMU.V_CELL[i] * 0.02);
+    }
+    Serial.printf("Temp1: %.2f ", getTemp(TEMP_SENSOR1_PIN, 0));
+    Serial.printf("Temp2: %.2f", getTemp(TEMP_SENSOR2_PIN, 0));
     Serial.println();
     debug_timer = millis();
   }
