@@ -157,8 +157,8 @@ void loop() {
 
   #if DEBUG_MODE == 1
   if (SESSION_TIME - debug_timer >= 500) {
-    for (int j = 0; j < MODULE_NUM; j++) debugBMUModule(&BMU_Package[j],j);
-    // debugAMSstate(&AMS_Package);
+    // for (int j = 0; j < MODULE_NUM; j++) debugBMUModule(BMU_Package, j);
+    debugAMSstate(&AMS_Package);
     debug_timer = millis();
   }
   #endif 
@@ -210,7 +210,7 @@ void loop() {
   else if (SESSION_TIME - Sustained_Communicate_Time >= DISCONNENCTION_TIMEOUT) {
     digitalWrite(AMS_OUT, LOW);
     if (SESSION_TIME - shutdown_timer >= 500) {
-      Serial.println("NO_BYTE_RECV");
+      Serial.println("********************NO_BYTE_RECV********************");
       shutdown_timer = millis();
     }
     resetAllStruct();
@@ -223,6 +223,9 @@ void loop() {
     BMU_Package[i].BMUconnected = isModuleActive(i);
     if (!BMU_Package[i].BMUconnected) allConnected = false;
   }
+
+
+  /*==================== Real-time Connection Check ====================*/
 
   // Handle BMU disconnection
   if (!allConnected) {
@@ -259,10 +262,6 @@ void loop() {
     }
     aggregation_timer = SESSION_TIME;
   }
-
-  /*==================== Real-time Connection Check ====================*/
-
-  
   
 
   /*==================== AMS_OK Determination ====================*/
@@ -289,9 +288,9 @@ void loop() {
 
   // Charging mode fault handling
   if (CHARGER_PLUGGED) {
-    uint16_t OBCFault = OBC_Package.OBCstatusbit;
-    ACCUM_ReadytoCharge = (AMS_Package.ACCUM_CHG_READY > 0);
-    AMS_OK = !(ACCUMULATOR_Fault || OBCFault || !ACCUM_ReadytoCharge);
+    ACCUM_ReadytoCharge;
+    uint16_t OBCFault = OBC_Package.OBCstatusbit; // status bit > 0 is fault
+    AMS_OK = !(ACCUMULATOR_Fault || OBCFault);
   }
 
   /*==================== Output Control ====================*/
@@ -302,16 +301,15 @@ void loop() {
 /************************* CAN Message Packing ***************************/
 
 void packBCU_toBMUmsg(twai_message_t *BCUsent, uint16_t bcu_transimission_time, bool is_charger_plugged) {
-  uint8_t* transmission_time = splitHLbyte(bcu_transimission_time);
   BCUsent->identifier = BCU_ADD;
   BCUsent->data_length_code = 8;
-  BCUsent->data[0] = transmission_time[0];
-  BCUsent->data[1] = transmission_time[1];
-  BCUsent->data[2] = is_charger_plugged ? 1 : 0;
-  BCUsent->data[3] = (uint8_t)(VmaxCell / 0.1f);
-  BCUsent->data[4] = (uint8_t)(VminCell / 0.1f);
-  BCUsent->data[5] = (uint8_t)TempMaxCell;
-  BCUsent->data[6] = (uint8_t)(dVmax / 0.1f);
+  BCUsent->data[0] = is_charger_plugged ? 1 : 0;
+  BCUsent->data[1] = AMS_OK; // allows AMS_OK
+  BCUsent->data[2] = (uint8_t)(VmaxCell / 0.1f);
+  BCUsent->data[3] = (uint8_t)(VminCell / 0.1f);
+  BCUsent->data[4] = (uint8_t)TempMaxCell;
+  BCUsent->data[5] = (uint8_t)(dVmax / 0.1f);
+  BCUsent->data[6] = 0;
   BCUsent->data[7] = BMUUpdateFlag;
 }
 
@@ -360,18 +358,18 @@ void processReceived_BMUmsg(twai_message_t *receivedframe, BMUdata *BMU_Package)
         BMU_Package[i].DV = receivedframe->data[3];
         BMU_Package[i].TEMP_SENSE[0] = mergeHLbyte(receivedframe->data[4],
                                                     receivedframe->data[5]);
-        BMU_Package[i].TEMP_SENSE[1] = mergeHLbyte(receivedframe->data[7],
-                                                    receivedframe->data[8]);
+        BMU_Package[i].TEMP_SENSE[1] = mergeHLbyte(receivedframe->data[6],
+                                                    receivedframe->data[7]);
         break;
 
       case 2:  // Cell voltages C1-C8
-        for (int j = 0; j < 8; j++) {
+        for (int j = 0; j < CELL_NUM - 2; j++) {
           BMU_Package[i].V_CELL[j] = receivedframe->data[j];
         }
         break;
 
       case 3:  // Cell voltages C9-C10
-        for (int j = 8; j < CELL_NUM; j++) {
+        for (int j = CELL_NUM-2; j < CELL_NUM; j++) {
           BMU_Package[i].V_CELL[j] = receivedframe->data[j - 8];
         }
         break;
@@ -425,7 +423,7 @@ void packing_AMSstruct(int moduleIndex) {
   AMS_Package.OVERDIV_CRITICAL |= BMU_Package[k].OVERDIV_VOLTAGE_CRITICAL;
 
   // AND together charge ready (all must be ready)
-  AMS_Package.ACCUM_CHG_READY &= BMU_Package[k].BMUneedBalance;
+  AMS_Package.ACCUM_CHG_READY = (AMS_Package.OVERDIV_CRITICAL > 0) ? 1 : 0;
 }
 
 void resetAllStruct() {
