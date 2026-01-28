@@ -30,6 +30,7 @@
 #define CS_PIN           7
 #define TEMP_SENSOR1_PIN 0
 #define TEMP_SENSOR2_PIN 2
+#define AMS_OUT          3    // AMS OK output signal
 
 /************************* Hardware Configuration ***************************/
 #define TOTAL_IC    1
@@ -51,8 +52,8 @@ float cellvoltages[NUM_CELLS];
 BMUdata myBMU;
 
 // BMU parameters (configurable from BCU at runtime)
-int transimission_time = BMS_COMMUNICATE_TIME;
 bool BCUallowsBalance = 0; 
+bool AMS_OK = false;
 float VmaxCell = VMAX_CELL;
 float VminCell = VMIN_CELL;
 float TempMaxCell = TEMP_MAX_CELL;
@@ -75,8 +76,7 @@ float currentTemp2 = 25.0f;
 // Balancing status array (index 0 = Cell 1)
 bool balancingStatus[NUM_CELLS];
 
-// BMU Module Number (set before flashing each BMU)
-int ModuleNumber = 8;
+
 
 // Timing
 unsigned long prevMillis = 0;
@@ -118,6 +118,8 @@ void debugConfig();
 
 /************************* Setup ***************************/
 
+// BMU Module Number (setbefore flashing each BMU)
+int ModuleNumber = 2;
 #define DEBUG_MODE 0 // Mode 1 = Regular, Mode 2 = Teleplot
 
 void setup() {
@@ -127,6 +129,8 @@ void setup() {
 
   // SPI setup for LTC6811
   pinMode(CS_PIN, OUTPUT);
+  pinMode(AMS_OUT,OUTPUT);
+  digitalWrite(AMS_OUT,LOW);
   digitalWrite(CS_PIN, HIGH);
   SPI.begin(4, 5, 6, 7);
   SPI.setDataMode(SPI_MODE3);
@@ -160,12 +164,7 @@ void loop() {
   /*==================== debugging ====================*/
   #if DEBUG_MODE == 1
   if(SESSION_TIME - debug_timer >= 500){
-    Serial.print("Vcell[10]: ");
-    for(int i = 0 ; i < CELL_NUM ; i ++){
-      Serial.printf("%.2f, ",myBMU.V_CELL[i] * 0.02);
-      // debugBMUModule(i);
-    }
-    Serial.println();
+    debugConfig();
     debug_timer = millis();
   }
   #endif
@@ -225,8 +224,9 @@ void loop() {
 
   // Process incoming CAN messages (BCU config updates)
   if (canbusready) {
-    while (CAN32_receiveCAN(&rx_message) == ESP_OK) {
+    if (CAN32_receiveCAN(&rx_message) == ESP_OK) {
       processBCUConfigMsg(&rx_message);
+
     }
   }
 
@@ -315,6 +315,9 @@ void loop() {
     checkCANHealth();
     lastCANHealthCheck = SESSION_TIME;
   }
+
+
+  digitalWrite(AMS_OUT, AMS_OK ? HIGH : LOW);
 }
 
 /************************* LTC6811 Functions ***************************/
@@ -387,19 +390,16 @@ void checkCANHealth() {
 void processBCUConfigMsg(twai_message_t* msg) {
   if (msg->identifier != BCU_ADD) return;
 
-  // Byte 2: BCU allows balancing (master command)
-  // This is always processed regardless of update flag
-  BCUallowsBalance = msg->data[2];
-
+  // Byte 0: BCU allows balancing (master command)
+  BCUallowsBalance = msg->data[0];
+  AMS_OK       = msg->data[1];
   // If Update flag is true, update configuration parameters
   bool BMUUpdateFlag = msg->data[7];
   if (!BMUUpdateFlag) return;
-
-  transimission_time = mergeHLbyte(msg->data[0], msg->data[1]);
-  VmaxCell     = msg->data[3] * 0.1f;
-  VminCell     = msg->data[4] * 0.1f;
-  TempMaxCell  = msg->data[5];
-  dVmax        = msg->data[6] * 0.1f;
+  VmaxCell     = msg->data[2] * 0.1f;
+  VminCell     = msg->data[3] * 0.1f;
+  TempMaxCell  = msg->data[4];
+  dVmax        = msg->data[5] * 0.1f;
 
   updateThresholds();
 }
@@ -646,8 +646,8 @@ bool* balanceCells(float vmaxCell, float vminCell, float tempMaxCell, float dvMa
 
 void debugConfig() {
   Serial.println("=== BMU Runtime Config ===");
-  Serial.printf("SyncTime: %dms\n", transimission_time);
   Serial.printf("ReadyToCharge: %s\n", myBMU.BMUneedBalance ? "YES" : "NO");
+  Serial.printf("AMS_OK: %d\n", AMS_OK);
   Serial.printf("VmaxCell: %.1fV\n", VmaxCell);
   Serial.printf("VminCell: %.1fV\n", VminCell);
   Serial.printf("TempMax: %.0fC\n", TempMaxCell);

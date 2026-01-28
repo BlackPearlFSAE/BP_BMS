@@ -5,7 +5,7 @@
 
 // Cell Configuration 
 #define CELL_NUM 10
-#define MODULE_NUM 8
+#define MODULE_NUM 9
 // #define MODULE_NUM 2 // Test config
 // #define MODULE_NUM 0 // Headless config
 

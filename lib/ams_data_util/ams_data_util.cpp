@@ -32,7 +32,8 @@ void debugAMSstate(AMSdata* myAMS) {
   Serial.println();
 }
 
-void debugBMUModule(BMUdata* myBMU,int moduleNum) {
+void debugBMUModule(BMUdata* myBMU, int moduleNum) {
+  // moduleNum is 0-indexed, display as 1-indexed for user
   Serial.printf("=== BMU %d (ID: %X) ===\n", moduleNum + 1, myBMU[moduleNum].BMU_ID);
   Serial.printf("V_MODULE: %.2fV\n", myBMU[moduleNum].V_MODULE * 0.02f);
   Serial.print("V_CELL: ");
@@ -40,11 +41,11 @@ void debugBMUModule(BMUdata* myBMU,int moduleNum) {
     Serial.printf("%.2f ", myBMU[moduleNum].V_CELL[i] * 0.02f);
   } Serial.println("V");
 
-  Serial.printf("DV: %.2fV\n", myBMU[moduleNum].DV * 0.2f);
-  Serial.printf("TEMP: %.1fv, %.1fv\n",
-    myBMU[moduleNum].TEMP_SENSE[0] * 0.1,
-    myBMU[moduleNum].TEMP_SENSE[1] * 0.1);
-  Serial.printf("Ready to Charge: %d, Connected: %d\n",
+  Serial.printf("DV: %.2fV\n", myBMU[moduleNum].DV * 0.1f);
+  Serial.printf("TEMP: %.1fC, %.1fC\n",
+    myBMU[moduleNum].TEMP_SENSE[0] * 0.1f,
+    myBMU[moduleNum].TEMP_SENSE[1] * 0.1f);
+  Serial.printf("NeedBalance: %d, Connected: %d\n",
     myBMU[moduleNum].BMUneedBalance,
     myBMU[moduleNum].BMUconnected);
   
@@ -63,7 +64,7 @@ void debugBMUModule(BMUdata* myBMU,int moduleNum) {
 
   Serial.print("  OT warn:");
   Serial.println(myBMU[moduleNum].OVERTEMP_WARNING, BIN);
-  Serial.print("  OT warn:");
+  Serial.print("  OT crit:");
   Serial.println(myBMU[moduleNum].OVERTEMP_CRITICAL, BIN);
 
   Serial.print("  DV warn:");
