@@ -119,8 +119,8 @@ void debugConfig();
 /************************* Setup ***************************/
 
 // BMU Module Number (setbefore flashing each BMU)
-int ModuleNumber = 2;
-#define DEBUG_MODE 0 // Mode 1 = Regular, Mode 2 = Teleplot
+int ModuleNumber = 3;
+#define DEBUG_MODE 1 // Mode 1 = Regular, Mode 2 = Teleplot
 
 void setup() {
   Serial.begin(115200);
@@ -164,7 +164,8 @@ void loop() {
   /*==================== debugging ====================*/
   #if DEBUG_MODE == 1
   if(SESSION_TIME - debug_timer >= 500){
-    debugConfig();
+    // debugConfig();
+    debugBMU(&myBMU, ModuleNumber);
     debug_timer = millis();
   }
   #endif

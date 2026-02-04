@@ -232,7 +232,7 @@ void loop() {
     digitalWrite(AMS_OUT, LOW);
     
     if (SESSION_TIME - debug_timer >= 500) {
-      Serial.println("BMU_DISCONNECTED:");
+      Serial.println("-----------BMU_DISCONNECTED:");
       for (int i = 0; i < MODULE_NUM; i++) {
         if (!BMU_Package[i].BMUconnected) Serial.printf("  Module %d\n", i + 1); 
       }

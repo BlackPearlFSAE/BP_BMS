@@ -5,7 +5,7 @@
 
 // Cell Configuration 
 #define CELL_NUM 10
-#define MODULE_NUM 9
+#define MODULE_NUM 7
 // #define MODULE_NUM 2 // Test config
 // #define MODULE_NUM 0 // Headless config
 
@@ -25,7 +25,7 @@
 #define STANDARD_BIT_RATE TWAI_TIMING_CONFIG_250KBITS()
 #define OBC_COMMUNICATE_TIME  500
 #define BMS_COMMUNICATE_TIME  1000
-#define DISCONNENCTION_TIMEOUT BMS_COMMUNICATE_TIME * 2.3
+#define DISCONNENCTION_TIMEOUT BMS_COMMUNICATE_TIME * 1.5
 #define BCU_ADD 0x18000000
 #define OBC_ADD 0x1806E5F4
 
@@ -72,7 +72,7 @@ struct AMSdata {
   bool OVERDIV_CRITICAL = 0;
 
   // bool AMS_OK = 0; // Use this for Active Low Output
-  bool AMS_OK = 0; // Use this for Active High Output
+  bool AMS_OK = 1; // Use this for Active High Output
 };
 
 // Physical condition of OBC On board charger
@@ -98,5 +98,7 @@ void teleplotOBCmsg(OBCdata *myOBC);
 void teleplotAllModules(BMUdata *BMU_Package, int moduleCount);
 void teleplotLocalCells(float *cellvoltages, int cellCount, const char* prefix);
 
-
-
+// Mock data generators (for testing without hardware)
+void mockBMU(BMUdata *bmu, int moduleNum);
+void mockAMS(AMSdata *ams, BMUdata *bmuArray);
+void mockOBC(OBCdata *obc);

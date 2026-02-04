@@ -4,15 +4,13 @@
 #include <ams_data_util.h>
 
 void debugAMSstate(AMSdata* myAMS) {
-  float accumvolt = myAMS->ACCUM_VOLTAGE;
-
-  Serial.printf("AMS_VOLTAGE: %.2f \n",myAMS->ACCUM_VOLTAGE);
-  Serial.printf("MIN_Voltage: %.2f MAX_Voltage: %.2f\n", 
-    myAMS->ACCUM_MINVOLTAGE,myAMS->ACCUM_MAXVOLTAGE);
-  Serial.printf("--Fault status of AMS--\n",MODULE_NUM);
   Serial.printf("AMS_OK: %d\n", myAMS->AMS_OK);
-  
+  Serial.printf("AMS_VOLT: %.2f Low: %d Full: %d \n", myAMS->ACCUM_VOLTAGE);
+  Serial.printf("AMS_MAX: %.2f \n", myAMS->ACCUM_MAXVOLTAGE);
+  Serial.printf("AMS_MIN: %.2f\n", myAMS->ACCUM_MINVOLTAGE);
+
   Serial.printf("--Fault status of [%d] Modules--\n",MODULE_NUM);
+
   Serial.print("OV_WARN: ");
   Serial.println(myAMS->OVERVOLT_WARNING, BIN);
   Serial.print("OV_CRIT: ");
@@ -29,11 +27,9 @@ void debugAMSstate(AMSdata* myAMS) {
   Serial.println(myAMS->OVERDIV_WARNING, BIN);
   Serial.print("DV_CRIT: ");
   Serial.println(myAMS->OVERDIV_CRITICAL, BIN);
-  Serial.println();
 }
 
-void debugBMUModule(BMUdata* myBMU, int moduleNum) {
-  // moduleNum is 0-indexed, display as 1-indexed for user
+void debugBMUModule(BMUdata* myBMU,int moduleNum) {
   Serial.printf("=== BMU %d (ID: %X) ===\n", moduleNum + 1, myBMU[moduleNum].BMU_ID);
   Serial.printf("V_MODULE: %.2fV\n", myBMU[moduleNum].V_MODULE * 0.02f);
   Serial.print("V_CELL: ");
@@ -41,11 +37,11 @@ void debugBMUModule(BMUdata* myBMU, int moduleNum) {
     Serial.printf("%.2f ", myBMU[moduleNum].V_CELL[i] * 0.02f);
   } Serial.println("V");
 
-  Serial.printf("DV: %.2fV\n", myBMU[moduleNum].DV * 0.1f);
-  Serial.printf("TEMP: %.1fC, %.1fC\n",
-    myBMU[moduleNum].TEMP_SENSE[0] * 0.1f,
-    myBMU[moduleNum].TEMP_SENSE[1] * 0.1f);
-  Serial.printf("NeedBalance: %d, Connected: %d\n",
+  Serial.printf("DV: %.2fV\n", myBMU[moduleNum].DV * 0.2f);
+  Serial.printf("TEMP: %.1fv, %.1fv\n",
+    myBMU[moduleNum].TEMP_SENSE[0] * 0.0125f + 2,
+    myBMU[moduleNum].TEMP_SENSE[1] * 0.0125f + 2);
+  Serial.printf("Ready to Charge: %d, Connected: %d\n",
     myBMU[moduleNum].BMUneedBalance,
     myBMU[moduleNum].BMUconnected);
   
@@ -64,7 +60,7 @@ void debugBMUModule(BMUdata* myBMU, int moduleNum) {
 
   Serial.print("  OT warn:");
   Serial.println(myBMU[moduleNum].OVERTEMP_WARNING, BIN);
-  Serial.print("  OT crit:");
+  Serial.print("  OT warn:");
   Serial.println(myBMU[moduleNum].OVERTEMP_CRITICAL, BIN);
 
   Serial.print("  DV warn:");
@@ -178,5 +174,98 @@ void teleplotLocalCells(float* cellvoltages, int cellCount, const char* prefix) 
   for (int i = 0; i < cellCount; i++) {
     Serial.printf(">%s_C%d:%.3f\n", prefix, i + 1, cellvoltages[i]);
   }
+}
+
+/************************* Mock Data Generators ***************************/
+
+void mockBMU(BMUdata* bmu, int moduleNum) {
+  bmu->BMU_ID = 0x18200001 + (moduleNum << 16);
+  bmu->BMUconnected = true;
+
+  if (moduleNum < MODULE_NUM / 2) {
+    // Good modules: uniform cells, no faults
+    bmu->BMUneedBalance = 1;
+    bmu->DV = 5;
+    bmu->TEMP_SENSE[0] = 0xC8;
+    bmu->TEMP_SENSE[1] = 0xC8;
+    for (int j = 0; j < CELL_NUM; j++) {
+      bmu->V_CELL[j] = 185;
+    }
+    bmu->OVERVOLTAGE_WARNING = 0x0000;
+    bmu->OVERVOLTAGE_CRITICAL = 0x0000;
+    bmu->LOWVOLTAGE_WARNING = 0x0000;
+    bmu->LOWVOLTAGE_CRITICAL = 0x0000;
+    bmu->OVERTEMP_WARNING = 0x0000;
+    bmu->OVERTEMP_CRITICAL = 0x0000;
+    bmu->OVERDIV_VOLTAGE_WARNING = 0x0000;
+    bmu->OVERDIV_VOLTAGE_CRITICAL = 0x0000;
+    bmu->BalancingDischarge_Cells = 0x0000;
+  } else {
+    // Faulty modules: mixed cells, some faults
+    bmu->BMUneedBalance = 0;
+    bmu->DV = 15;
+    bmu->TEMP_SENSE[0] = 0xFA;
+    bmu->TEMP_SENSE[1] = 0xD0;
+    bmu->V_CELL[0] = 210;
+    bmu->V_CELL[1] = 205;
+    bmu->V_CELL[2] = 160;
+    bmu->V_CELL[3] = 185;
+    bmu->V_CELL[4] = 190;
+    bmu->V_CELL[5] = 155;
+    bmu->V_CELL[6] = 200;
+    bmu->V_CELL[7] = 185;
+    bmu->V_CELL[8] = 195;
+    bmu->V_CELL[9] = 175;
+    bmu->OVERVOLTAGE_WARNING = 0x0200;
+    bmu->OVERVOLTAGE_CRITICAL = 0x0000;
+    bmu->LOWVOLTAGE_WARNING = 0x0090;
+    bmu->LOWVOLTAGE_CRITICAL = 0x0000;
+    bmu->OVERTEMP_WARNING = 0x0200;
+    bmu->OVERTEMP_CRITICAL = 0x0000;
+    bmu->OVERDIV_VOLTAGE_WARNING = 0x0094;
+    bmu->OVERDIV_VOLTAGE_CRITICAL = 0x0000;
+    bmu->BalancingDischarge_Cells = 0x0201;
+  }
+}
+
+void mockAMS(AMSdata* ams, BMUdata* bmuArray) {
+  // Compute accumulator voltage from all modules
+  float totalVoltage = 0.0f;
+  bool anyOVWarn = false, anyOVCrit = false;
+  bool anyLVWarn = false, anyLVCrit = false;
+  bool anyOTWarn = false, anyOTCrit = false;
+  bool anyDVWarn = false, anyDVCrit = false;
+
+  for (int i = 0; i < MODULE_NUM; i++) {
+    totalVoltage += bmuArray[i].V_MODULE * 0.02f;
+    if (bmuArray[i].OVERVOLTAGE_WARNING)  anyOVWarn = true;
+    if (bmuArray[i].OVERVOLTAGE_CRITICAL) anyOVCrit = true;
+    if (bmuArray[i].LOWVOLTAGE_WARNING)   anyLVWarn = true;
+    if (bmuArray[i].LOWVOLTAGE_CRITICAL)  anyLVCrit = true;
+    if (bmuArray[i].OVERTEMP_WARNING)     anyOTWarn = true;
+    if (bmuArray[i].OVERTEMP_CRITICAL)    anyOTCrit = true;
+    if (bmuArray[i].OVERDIV_VOLTAGE_WARNING)  anyDVWarn = true;
+    if (bmuArray[i].OVERDIV_VOLTAGE_CRITICAL) anyDVCrit = true;
+  }
+
+  ams->ACCUM_VOLTAGE = totalVoltage;
+  ams->OVERVOLT_WARNING = anyOVWarn;
+  ams->OVERVOLT_CRITICAL = anyOVCrit;
+  ams->LOWVOLT_WARNING = anyLVWarn;
+  ams->LOWVOLT_CRITICAL = anyLVCrit;
+  ams->OVERTEMP_WARNING = anyOTWarn;
+  ams->OVERTEMP_CRITICAL = anyOTCrit;
+  ams->OVERDIV_WARNING = anyDVWarn;
+  ams->OVERDIV_CRITICAL = anyDVCrit;
+
+  ams->AMS_OK = !(anyOVCrit || anyLVCrit || anyOTCrit || anyDVCrit);
+  ams->ACCUM_CHG_READY = ams->AMS_OK && !anyOVWarn;
+}
+
+void mockOBC(OBCdata* obc) {
+  obc->OBCVolt = 4800;   // 48.00V (typical charger voltage)
+  obc->OBCAmp = 100;     // 1.00A (typical charge current)
+  obc->OBCstatusbit = 0; // No faults
+  obc->OBC_OK = true;
 }
 
