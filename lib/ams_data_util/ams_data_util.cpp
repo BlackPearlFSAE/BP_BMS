@@ -30,7 +30,7 @@ void debugAMSstate(AMSdata* myAMS) {
 }
 
 void debugBMUModule(BMUdata* myBMU,int moduleNum) {
-  Serial.printf("=== BMU %d (ID: %X) ===\n", moduleNum + 1, myBMU[moduleNum].BMU_ID);
+  Serial.printf("=== BMU %d (ID: %X) ===\n", moduleNum, myBMU[moduleNum].BMU_ID);
   Serial.printf("V_MODULE: %.2fV\n", myBMU[moduleNum].V_MODULE * 0.02f);
   Serial.print("V_CELL: ");
   for (int i = 0; i < CELL_NUM; i++) {

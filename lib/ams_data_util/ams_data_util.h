@@ -12,7 +12,8 @@
 /*LG34 Battery*/
 #define VMAX_CELL 4.2
 #define VNOM_CELL 3.7
-#define VMIN_CELL 3.2
+#define VMIN_CELL 2.9
+// #define VMIN_CELL 3.2
 #define AH_CELL 34 // Ah
 #define DVMAX 0.2
 

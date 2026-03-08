@@ -112,6 +112,7 @@ float calculateDV();
 void updateFaultFlags();
 bool isCellBalanced(uint8_t cellIndex);
 bool* balanceCells(float vmaxCell, float vminCell, float tempMaxCell, float dvMax);
+void balanceManual(uint16_t cellBitmask);
 
 // Debug
 void debugConfig();
@@ -119,8 +120,8 @@ void debugConfig();
 /************************* Setup ***************************/
 
 // BMU Module Number (setbefore flashing each BMU)
-int ModuleNumber = 3;
-#define DEBUG_MODE 1 // Mode 1 = Regular, Mode 2 = Teleplot
+int ModuleNumber = 7;
+#define DEBUG_MODE 2 // Mode 1 = Regular, Mode 2 = Teleplot
 
 void setup() {
   Serial.begin(115200);
@@ -160,12 +161,23 @@ uint32_t teleplot_timer = 0;
 
 void loop() {
   uint32_t SESSION_TIME = millis();
-
+  // BCUallowsBalance = 0;
+  
   /*==================== debugging ====================*/
   #if DEBUG_MODE == 1
   if(SESSION_TIME - debug_timer >= 500){
-    // debugConfig();
-    debugBMU(&myBMU, ModuleNumber);
+    // Simple local debug output (raw float values for accuracy)
+    Serial.printf("=== BMU %d ===\n", ModuleNumber);
+    Serial.printf("Module: %.2fV | DV: %.2fV | Temp: %.1f/%.1fC\n",
+      myBMU.V_MODULE * 0.02f, myBMU.DV * 0.1f, currentTemp1, currentTemp2);
+    Serial.print("Cells: ");
+    for (int i = 0; i < NUM_CELLS; i++) {
+      Serial.printf("%.2f ", cellvoltages[i]);
+    }
+    Serial.println("V");
+    Serial.printf("Balance: 0x%03X | NeedBal: %d\n\n",
+      myBMU.BalancingDischarge_Cells, myBMU.BMUneedBalance);
+
     debug_timer = millis();
   }
   #endif
@@ -199,12 +211,14 @@ void loop() {
 
   /*==================== Sensor Reading ====================*/
 
-  // Read temperatures and populate myBMU.TEMP_SENSE
-  currentTemp1 = (uint16_t)(getTemp(TEMP_SENSOR1_PIN, 0));
-  currentTemp2 = (uint16_t)(getTemp(TEMP_SENSOR2_PIN, 0));
+  // Read temperatures (keep as float for local monitoring)
+  currentTemp1 = getTemp(TEMP_SENSOR1_PIN, 0);
+  currentTemp2 = getTemp(TEMP_SENSOR2_PIN, 0);
+
+  // Encode for CAN transmission (stored as raw Celsius for debugging)
+  myBMU.TEMP_SENSE[0] = (uint8_t)currentTemp1;
+  myBMU.TEMP_SENSE[1] = (uint8_t)currentTemp2;
   // Serial.printf("Temp1: %.2f C, Temp2: %.2f C\n", currentTemp1, currentTemp2);
-  myBMU.TEMP_SENSE[0] = currentTemp1;
-  myBMU.TEMP_SENSE[1] = currentTemp2;
 
   // Read cell voltages from LTC6811 (also populates myBMU.V_CELL and V_MODULE)
   readAllCells();
@@ -242,9 +256,10 @@ void loop() {
 
   // Cell balancing only when BCU allows (master-slave control)
   if (BCUallowsBalance) {
+    // balanceManual(0b0000001100);
     bool* cells_in_balance = balanceCells(VmaxCell, VminCell, TempMaxCell, dVmax);
-    for (int i = 0; i < NUM_CELLS; i++)
-      balancingStatus[i] = cells_in_balance[i];
+    // for (int i = 0; i < NUM_CELLS; i++)
+    //   balancingStatus[i] = cells_in_balance[i];
   } else {
     // Clear balancing when not allowed
     bms_ic[0].config.tx_data[4] = 0;
@@ -629,6 +644,47 @@ bool* balanceCells(float vmaxCell, float vminCell, float tempMaxCell, float dvMa
                                  ((dischargeBits >> 8) & 0x03);
   LTC6811_wrcfg(TOTAL_IC, bms_ic);
   return balanceCellsArray;
+}
+
+// Manual cell balancing - specify exact cells to balance via bitmask
+// cellBitmask: 10-bit LSB format where bit 0 = Cell 1, bit 9 = Cell 10
+// Example: 0x003 = balance Cell 1 and Cell 2
+//          0x201 = balance Cell 1 and Cell 10
+//          0x3FF = balance all 10 cells
+void balanceManual(uint16_t cellBitmask) {
+  // Mask to only 10 bits (cells 1-10)
+  cellBitmask &= 0x3FF;
+
+  // Update balancing status array and BMU struct
+  for (int i = 0; i < NUM_CELLS; i++) {
+    balancingStatus[i] = (cellBitmask & (1 << i)) != 0;
+  }
+
+  // Update CAN message format (MSB-first: bit 9 = Cell 1)
+  myBMU.BalancingDischarge_Cells = 0;
+  for (int i = 0; i < NUM_CELLS; i++) {
+    if (balancingStatus[i]) {
+      myBMU.BalancingDischarge_Cells |= (1 << (9 - i));
+    }
+  }
+
+  // Configure LTC6811 discharge registers (LSB-first: bit 0 = Cell 1)
+  bms_ic[0].config.tx_data[4] = cellBitmask & 0xFF;        // Cells 1-8
+  bms_ic[0].config.tx_data[5] = (bms_ic[0].config.tx_data[5] & 0xFC) |
+                                 ((cellBitmask >> 8) & 0x03); // Cells 9-10
+  LTC6811_wrcfg(TOTAL_IC, bms_ic);
+
+  // Debug output
+  // Serial.printf("Manual balance: 0x%03X (", cellBitmask);
+  // bool first = true;
+  // for (int i = 0; i < NUM_CELLS; i++) {
+  //   if (cellBitmask & (1 << i)) {
+  //     if (!first) Serial.print(", ");
+  //     Serial.printf("Cell%d", i + 1);
+  //     first = false;
+  //   }
+  // }
+  // Serial.println(")");
 }
 
 /************************* Debugging ***************************/
